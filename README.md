@@ -1,2 +1,2 @@
 # Reddit-Eclipse
-Reddit Eclipse hides read posts on Reddit.
+Reddit Eclipse hides read posts on Reddit. You'll never see the same posts again on Reddit
