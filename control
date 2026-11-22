@@ -1,0 +1,9 @@
+Package: com.jax.reddit-eclipse
+Name: Jax Reddit Eclipse
+Version: 0.0.21b
+Architecture: iphoneos-arm
+Description: Hides posts you've already read in the official Reddit app.
+Maintainer: Your Name <you@example.com>
+Author: Your Name <you@example.com>
+Section: Tweaks
+Depends: mobilesubstrate (>= 0.9.5000), firmware (>= 14.0)
