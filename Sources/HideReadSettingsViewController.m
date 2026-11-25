@@ -1,5 +1,6 @@
 #import "HideReadSettingsViewController.h"
 #import "HRAccountHider.h"
+#import "HRArtwork.h"
 #import "HRHideButton.h"
 #import <objc/runtime.h>
 #import "HRResponseProcessor.h"
@@ -15,6 +16,7 @@ typedef NS_ENUM(NSInteger, HRRowKind) {
   HRRowKindAccountStatus,  // hidden on your account so far, and what's happening
   HRRowKindHideAllRead,    // Hide All Read Posts Now (or Stop, while it runs)
   HRRowKindSession,        // this session: posts seen in feeds, counted as read
+  HRRowKindLink,           // opens its "url" outside Reddit
 };
 
 static NSString *HRFormatted(NSUInteger count) {
@@ -142,12 +144,10 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
         @{@"title" : @"Hide Button in Tab Bar", @"pref" : HRPrefHideButton, @"kind" : @(HRRowKindSwitch)},
         @{@"title" : @"“Posts Hidden” Note", @"pref" : HRPrefHiddenNote, @"kind" : @(HRRowKindSwitch)},
       ],
-      @"footer" : @"Read posts are left out whenever a feed loads. Tap Hide, between Inbox and "
-                  @"You, to hide all your read posts on your Reddit account; touch and hold it to "
-                  @"open these settings. With the button off, a two-finger double tap anywhere "
-                  @"opens them instead. If Reddit ever freezes as the button goes in, it turns "
-                  @"itself off. The note fades in at the top now and then, once you stop "
-                  @"scrolling, to say how many posts you’ve scrolled past were hidden.",
+      @"footer" : @"Read posts are left out whenever a feed loads. Tap Hide to hide all your read "
+                  @"posts on your Reddit account; touch and hold it for these settings. With the "
+                  @"button off, double-tap with two fingers instead. The note shows how many posts "
+                  @"you scrolled past were hidden.",
     },
     @{
       @"header" : @"Reddit Account",
@@ -156,14 +156,11 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
         @{@"title" : @"Hidden on Your Account", @"kind" : @(HRRowKindAccountStatus)},
         @{@"title" : @"Hide All Read Posts Now", @"kind" : @(HRRowKindHideAllRead)},
       ],
-      @"footer" : @"Posts counted as read are also hidden on your Reddit account, as “Hide post” "
-                  @"in a post’s ⋯ menu does: they go on your Hidden list and stay out of your "
-                  @"feeds on every device. They’re sent a few at a time, about 20 seconds after "
-                  @"they’re counted. A post still in the list you’re scrolling keeps “Hide post” in "
-                  @"its ⋯ menu until that feed loads again. “Hide All Read Posts Now” sends every "
-                  @"post in your read history that isn’t hidden yet, even with the switch off, as "
-                  @"a tap on Hide in the tab bar does. "
-                  @"Clearing the read history doesn’t unhide anything.",
+      @"footer" : @"Read posts also go on your account’s Hidden list, as with “Hide post” in the ⋯ "
+                  @"menu, so they stay out of your feeds on every device. They’re sent about 20 "
+                  @"seconds after they’re counted; until a feed reloads, its ⋯ menus still say "
+                  @"“Hide post”. “Hide All Read Posts Now” sends every read post not hidden yet, even "
+                  @"with the switch off. Clearing the read history doesn’t unhide anything.",
     },
     @{
       @"header" : @"Count a Post as Read When",
@@ -180,11 +177,10 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
           @"kind" : @(HRRowKindSwitch)
         },
       ],
-      @"footer" : @"“You Scroll Past It” hides a post once it has been on screen and "
-                  @"scrolled up out of view. It stays in the list you’re scrolling until the "
-                  @"feed reloads. “It Stays on Screen” counts a post you only looked at in the "
-                  @"feed: it follows Reddit’s own comment preloading, which starts once a post "
-                  @"has been visible for a few seconds.",
+      @"footer" : @"“You Open It” includes opening a post’s video, images or link full screen. A "
+                  @"post you scroll past stays in the list until the feed reloads. “It Stays on "
+                  @"Screen” counts a post visible for a few seconds, using Reddit’s own comment "
+                  @"preloading.",
     },
     @{
       @"header" : @"Also Hide Read Posts In",
@@ -208,15 +204,42 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
         @{@"title" : @"Diagnostic Log", @"pref" : HRPrefDiagnostics, @"kind" : @(HRRowKindSwitch)},
         @{@"title" : @"View Log", @"kind" : @(HRRowKindViewLog)},
       ],
-      @"footer" : [NSString
-          stringWithFormat:@"Touch and hold Hide in the tab bar to open these settings. "
-                           @"With the Hide button off, double-tap with two fingers anywhere "
-                           @"in Reddit instead.\n\n"
-                           @"Jax Reddit Eclipse %@",
-                           HRTweakVersion],
+      @"footer" : [@"Jax Reddit Eclipse " stringByAppendingString:HRTweakVersion],
+    },
+    @{
+      @"rows" : @[
+        @{@"title" : @"🍺 Buy me a beer", @"url" : @"https://opentipjar.com/jax_eclipse", @"kind" : @(HRRowKindLink)},
+        @{@"title" : @"Source Code", @"url" : @"https://github.com/alienjax/Reddit-Eclipse", @"kind" : @(HRRowKindLink)},
+      ],
     },
   ];
 }
+
+// Solid, then see-through over the last `fade` points, eased so neither end of
+// the fade shows a line. As a mask, it fades a view out towards its bottom.
+static UIImage *HRFadeMask(CGFloat height, CGFloat fade) {
+  UIGraphicsImageRenderer *renderer =
+      [[UIGraphicsImageRenderer alloc] initWithSize:CGSizeMake(1, height)];
+  return [renderer imageWithActions:^(UIGraphicsImageRendererContext *context) {
+    for (int y = 0; y < height; y++) {
+      CGFloat t = MIN(MAX((y + 0.5 - (height - fade)) / fade, 0.0), 1.0);
+      [[UIColor colorWithWhite:0 alpha:1 - t * t * (3 - 2 * t)] setFill];
+      [context fillRect:CGRectMake(0, y, 1, 1)];
+    }
+  }];
+}
+
+// The night sky at the top of the settings. Its mask makes it see-through
+// towards the bottom, so the page shows through, light or dark.
+@interface HideReadSkyView : UIImageView
+@end
+
+@implementation HideReadSkyView
+- (void)layoutSubviews {
+  [super layoutSubviews];
+  self.maskView.frame = self.bounds;  // keeps the fade as wide as the sky
+}
+@end
 
 @implementation HideReadSettingsViewController {
   NSArray<NSDictionary *> *_sections;
@@ -240,10 +263,48 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
       [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
                                                     target:self
                                                     action:@selector(done)];
+  self.tableView.tableHeaderView = [self artworkHeader];
   [NSNotificationCenter.defaultCenter addObserver:self
                                          selector:@selector(accountStatusChanged)
                                              name:HRAccountHiderStatusDidChangeNotification
                                            object:nil];
+}
+
+// The night sky across the top with the tweak's icon in it. Its lower half
+// fades into the page, so the settings carry on from it; it scrolls away with
+// them.
+- (UIView *)artworkHeader {
+  CGRect frame = CGRectMake(0, 0, self.tableView.bounds.size.width, 200);
+  UIView *header = [[UIView alloc] initWithFrame:frame];
+  header.accessibilityElementsHidden = YES;
+
+  HideReadSkyView *scene = [[HideReadSkyView alloc] initWithImage:HRArtworkScene()];
+  scene.contentMode = UIViewContentModeScaleAspectFill;
+  scene.maskView = [[UIImageView alloc] initWithImage:HRFadeMask(frame.size.height, 100)];
+  scene.accessibilityIgnoresInvertColors = YES;
+  scene.translatesAutoresizingMaskIntoConstraints = NO;
+
+  UIImageView *icon = [[UIImageView alloc] initWithImage:HRArtworkIcon()];
+  icon.layer.shadowColor = UIColor.blackColor.CGColor;
+  icon.layer.shadowOpacity = 0.5;
+  icon.layer.shadowRadius = 10;
+  icon.layer.shadowOffset = CGSizeMake(0, 4);
+  icon.accessibilityIgnoresInvertColors = YES;
+  icon.translatesAutoresizingMaskIntoConstraints = NO;
+
+  [header addSubview:scene];
+  [header addSubview:icon];
+  [NSLayoutConstraint activateConstraints:@[
+    [scene.leadingAnchor constraintEqualToAnchor:header.leadingAnchor],
+    [scene.trailingAnchor constraintEqualToAnchor:header.trailingAnchor],
+    [scene.topAnchor constraintEqualToAnchor:header.topAnchor],
+    [scene.bottomAnchor constraintEqualToAnchor:header.bottomAnchor],
+    [icon.centerXAnchor constraintEqualToAnchor:header.centerXAnchor],
+    [icon.centerYAnchor constraintEqualToAnchor:header.topAnchor constant:92],
+    [icon.widthAnchor constraintEqualToConstant:88],
+    [icon.heightAnchor constraintEqualToConstant:88],
+  ]];
+  return header;
 }
 
 // The rows that show what hiding on your account is up to, redrawn in place.
@@ -286,6 +347,13 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
   return _sections[section][@"header"];
+}
+
+// The first section has no title; the bottom of the night sky already fades
+// into the page, so it only needs a small gap. Other sections keep the usual
+// height.
+- (CGFloat)tableView:(UITableView *)tableView heightForHeaderInSection:(NSInteger)section {
+  return section == 0 && !_sections[0][@"header"] ? 8 : tableView.sectionHeaderHeight;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
@@ -356,7 +424,7 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
       content.text = row[@"title"];
       NSUInteger counted = HideReadStore.sharedStore.sessionCount;
       content.secondaryText = [NSString
-          stringWithFormat:@"%@ posts seen in feeds · %@ counted as read, %@ of them scrolled past",
+          stringWithFormat:@"%@ seen in feeds · %@ counted as read (%@ scrolled past)",
                            HRFormatted(HRFeedPostsSeenCount()), HRFormatted(counted),
                            HRFormatted(MIN(HRScrollTrackerScrolledPastCount(), counted))];
       content.secondaryTextProperties.color = UIColor.secondaryLabelColor;
@@ -364,6 +432,11 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
       cell.selectionStyle = UITableViewCellSelectionStyleNone;
       break;
     }
+    case HRRowKindLink:
+      content.textProperties.color = self.view.tintColor ?: UIColor.systemBlueColor;
+      cell.accessibilityTraits |= UIAccessibilityTraitLink;
+      cell.accessibilityHint = @"Opens the page outside Reddit.";
+      break;
   }
   cell.contentConfiguration = content;
   return cell;
@@ -384,6 +457,11 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
       else
         [self confirmHideAllRead];
       break;
+    case HRRowKindLink: {
+      NSURL *url = [NSURL URLWithString:[self rowAtIndexPath:indexPath][@"url"]];
+      if (url) [UIApplication.sharedApplication openURL:url options:[NSDictionary dictionary] completionHandler:nil];
+      break;
+    }
     case HRRowKindSwitch:
     case HRRowKindReadCount:
     case HRRowKindAccountStatus:
@@ -411,9 +489,9 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
   NSString *time = minutes <= 1 ? @"under a minute" : [NSString stringWithFormat:@"about %lu minutes", (unsigned long)minutes];
   alert = [UIAlertController
       alertControllerWithTitle:@"Hide All Read Posts?"
-                       message:[NSString stringWithFormat:@"%@ posts you’ve read go on your Reddit account’s Hidden "
-                                                          @"list and stay out of your feeds on every device. It "
-                                                          @"takes %@ while Reddit is open, and you can keep browsing.",
+                       message:[NSString stringWithFormat:@"%@ read posts go on your account’s Hidden list, out of "
+                                                          @"your feeds on every device. It takes %@; you can keep "
+                                                          @"browsing.",
                                                           HRFormatted(count), time]
                 preferredStyle:UIAlertControllerStyleAlert];
   [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
@@ -489,10 +567,17 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
 
 static HideReadWindow *gSettingsWindow;
 
+// What's at the top of the screen now: a newer banner replaces both, and a faint
+// note waits out a banner.
+static __weak UIView *gBanner;
+static __weak UIView *gToast;
+
 void HRShowBanner(NSString *text, NSTimeInterval duration) {
   UIWindowScene *scene = HRActiveScene();
   UIWindow *window = gSettingsWindow ?: (HRMainWindow(scene) ?: HRKeyWindow());
   if (!window) return;
+  [gBanner removeFromSuperview];
+  [gToast removeFromSuperview];
 
   UILabel *label = [UILabel new];
   label.text = text;
@@ -510,6 +595,7 @@ void HRShowBanner(NSString *text, NSTimeInterval duration) {
   banner.alpha = 0;
   [banner addSubview:label];
   [window addSubview:banner];
+  gBanner = banner;
 
   [NSLayoutConstraint activateConstraints:@[
     [label.leadingAnchor constraintEqualToAnchor:banner.leadingAnchor constant:16],
@@ -539,10 +625,9 @@ void HRShowBanner(NSString *text, NSTimeInterval duration) {
 }
 
 void HRShowToast(NSString *text) {
-  static __weak UIView *current;
   UIWindow *window = HRMainWindow(HRActiveScene()) ?: HRKeyWindow();
-  if (!window) return;
-  [current removeFromSuperview];
+  if (!window || gBanner.superview) return;
+  [gToast removeFromSuperview];
 
   UILabel *label = [UILabel new];
   label.text = text;
@@ -559,7 +644,7 @@ void HRShowToast(NSString *text) {
   toast.alpha = 0;
   [toast addSubview:label];
   [window addSubview:toast];
-  current = toast;
+  gToast = toast;
 
   [NSLayoutConstraint activateConstraints:@[
     [label.leadingAnchor constraintEqualToAnchor:toast.leadingAnchor constant:12],

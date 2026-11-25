@@ -22,9 +22,13 @@ BOOL HRShouldWatchOperation(NSString *_Nullable operation);
 /// The post whose title is `text`, or one of its comma-separated parts (an
 /// on-screen label such as "r/sub, Title, 12 upvotes, ..."), among posts seen in
 /// recent feeds, or nil. With `searchInside`, a title anywhere in the text (as
-/// whole words) also counts. Titles are only kept while the log or "You Scroll
-/// Past It" is on.
+/// whole words) also counts. Titles are only kept while the log, "You Open It"
+/// or "You Scroll Past It" is on.
 NSString *_Nullable HRPostIDForText(NSString *_Nullable text, BOOL searchInside);
+
+/// The title of a post seen in a feed or a post page since Reddit opened
+/// (shortened to 60 characters), or nil. Any thread.
+NSString *_Nullable HRPostTitle(NSString *_Nullable postID);
 
 /// Posts seen in feed responses since Reddit opened, read or not. Any thread.
 NSUInteger HRFeedPostsSeenCount(void);

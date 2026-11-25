@@ -1,4 +1,6 @@
 #import "HRScrollTracker.h"
+#import <UIKit/UIGestureRecognizerSubclass.h>
+#import <objc/runtime.h>
 #import "HideReadSettingsViewController.h"
 #import "HideReadStore.h"
 #import "HRResponseProcessor.h"
@@ -18,8 +20,11 @@
 // hidden while you browsed: scrolled past, or (with "It Stays on Screen" on)
 // counted while still on screen. While "“Posts Hidden” Note" is on.
 //
-// Only reading happens here: list positions, cells and their labels. Nothing in
-// Reddit's views is changed. Main thread only.
+// A tap on a card is noted too (see "Taps on post cards"): if the post's video,
+// images, link or page come up right after, it counts as opened.
+//
+// Only reading happens here: list positions, cells and their labels, and which
+// card a tap lands on. Nothing in Reddit's views is changed. Main thread only.
 
 static const NSTimeInterval kHRTickInterval = 0.2;
 static const CFAbsoluteTime kHRSearchInterval = 1.0;
@@ -371,11 +376,174 @@ static void HRWatchList(UIScrollView *list) {
   }
 }
 
+#pragma mark - Taps on post cards
+
+// A post's video, images or link can open full screen without its comments
+// ever loading, so "You Open It" also counts a post whose card you tap when one
+// of those, or the post's page, comes up within a second and a half. Taps are
+// seen by a gesture recognizer on Reddit's main window that never recognizes
+// anything: every other gesture, button and list gets each touch just as if it
+// weren't there.
+
+static const CFAbsoluteTime kHRTapToScreen = 1.5;  // seconds from a tap to the screen it opens
+static NSString *gTappedPost;                       // the card tapped last, until a screen takes it
+static CFAbsoluteTime gTappedTime;
+static NSString *gContentScreen;                    // the post-content screen that came up last
+static CFAbsoluteTime gContentScreenTime;
+
+static void HRMarkOpenedByTap(NSString *screen) {
+  NSString *postID = gTappedPost;
+  gTappedPost = nil;
+  gContentScreen = nil;
+  if (!postID || !HRPref(HRPrefMarkOpened) || ![HideReadStore.sharedStore markPostID:postID]) return;
+  HRLog(@"[read] %@ opened (its card was tapped, then %@ came up)", HRDescribePost(postID), screen);
+  HRShowReadHintIfNeeded();
+}
+
+// The view of the screen `view` is on: its controller's, or that one's parent's,
+// up to the screen-level controller (whose parent, if any, is a navigation, tab
+// bar or page controller).
+static UIView *HRScreenViewOf(UIView *view) {
+  UIViewController *controller = HROwningController(view);
+  for (UIViewController *parent = controller.parentViewController;
+       parent && ![parent isKindOfClass:UINavigationController.class] &&
+       ![parent isKindOfClass:UITabBarController.class] && ![parent isKindOfClass:UIPageViewController.class];
+       parent = parent.parentViewController)
+    controller = parent;
+  return controller.viewIfLoaded;
+}
+
+static BOOL HRIsInBar(UIView *view) {
+  for (; view; view = view.superview)
+    if ([view isKindOfClass:UITabBar.class] || [view isKindOfClass:UINavigationBar.class] ||
+        [view isKindOfClass:UIToolbar.class])
+      return YES;
+  return NO;
+}
+
+// The feed card a tap landed on: the cell holding `touched` (the view UIKit gave
+// the touch to), else the one under `point` (window coordinates) when what took
+// the touch is laid over the list on the same screen, as a video player can be.
+static UIView *HRTappedCard(UIScrollView *list, UIView *touched, CGPoint point, BOOL *overlaid) {
+  NSArray<UIView *> *cells = HRVisibleCells(list);
+  for (UIView *cell in cells)
+    if ([touched isDescendantOfView:cell]) return cell;
+  UIView *screen = HRScreenViewOf(list);
+  if (!screen || ![touched isDescendantOfView:screen] || HRIsInBar(touched)) return nil;
+  CGPoint inList = [list convertPoint:point fromView:nil];
+  UIEdgeInsets inset = list.adjustedContentInset;
+  CGFloat top = list.contentOffset.y + inset.top;
+  CGFloat bottom = list.contentOffset.y + list.bounds.size.height - inset.bottom;
+  if (inList.y < top || inList.y > bottom || inList.x < 0 || inList.x > list.bounds.size.width) return nil;
+  for (UIView *cell in cells)
+    if (!cell.hidden && CGRectContainsPoint(cell.frame, inList)) {
+      *overlaid = YES;
+      return cell;
+    }
+  return nil;
+}
+
+// A quick single tap: notes the post whose card in the feed it landed on.
+static void HRCardTapped(UIView *touched, CGPoint point) {
+  UIScrollView *list = gList;
+  if (!HRPref(HRPrefMarkOpened) || !list || !list.window || touched.window != list.window) return;
+  BOOL overlaid = NO;
+  UIView *card = HRTappedCard(list, touched, point, &overlaid);
+  NSString *postID = card ? HRPostIDForCell(card) : nil;
+  if (!postID) return;
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  gTappedPost = postID;
+  gTappedTime = now;
+  HRLog(@"[tap] %@ tapped%@", HRDescribePost(postID),
+        overlaid ? [NSString stringWithFormat:@" (on a %@ over its card)", NSStringFromClass(touched.class)] : @"");
+  // Its screen may have started coming up a moment before the tap got here.
+  if (gContentScreen && now - gContentScreenTime < 0.3) HRMarkOpenedByTap(gContentScreen);
+}
+
+@interface HideReadTapWatcher : UIGestureRecognizer <UIGestureRecognizerDelegate>
+@end
+
+@implementation HideReadTapWatcher {
+  CGPoint _start;
+  CFAbsoluteTime _startTime;
+  __weak UIView *_touched;
+}
+
+- (instancetype)init {
+  if ((self = [super initWithTarget:nil action:NULL])) {
+    self.cancelsTouchesInView = NO;
+    self.delaysTouchesBegan = NO;
+    self.delaysTouchesEnded = NO;
+    self.delegate = self;
+  }
+  return self;
+}
+
+- (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+  [super touchesBegan:touches withEvent:event];
+  if (touches.count != 1 || event.allTouches.count != 1) {
+    self.state = UIGestureRecognizerStateFailed;
+    return;
+  }
+  UITouch *touch = touches.anyObject;
+  _start = [touch locationInView:nil];
+  _startTime = CFAbsoluteTimeGetCurrent();
+  _touched = touch.view;
+}
+
+- (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+  [super touchesMoved:touches withEvent:event];
+  CGPoint point = [touches.anyObject locationInView:nil];
+  if (hypot(point.x - _start.x, point.y - _start.y) > 12) self.state = UIGestureRecognizerStateFailed;
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+  [super touchesEnded:touches withEvent:event];
+  UIView *touched = _touched;
+  _touched = nil;
+  if (touched && CFAbsoluteTimeGetCurrent() - _startTime < 0.8) HRCardTapped(touched, _start);
+  self.state = UIGestureRecognizerStateFailed;
+}
+
+- (void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+  [super touchesCancelled:touches withEvent:event];
+  _touched = nil;
+  self.state = UIGestureRecognizerStateFailed;
+}
+
+// It never recognizes, so it can't stand in another gesture's way; this makes sure.
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)other {
+  return YES;
+}
+
+@end
+
+static void HRWatchTaps(UIWindow *window) {
+  static char kWatcherKey;
+  if (!window || objc_getAssociatedObject(window, &kWatcherKey)) return;
+  HideReadTapWatcher *watcher = [HideReadTapWatcher new];
+  [window addGestureRecognizer:watcher];
+  objc_setAssociatedObject(window, &kWatcherKey, watcher, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+void HRScrollTrackerScreenAppeared(UIViewController *controller) {
+  if (!HRIsPostContentScreen(controller)) return;
+  NSString *name = NSStringFromClass(object_getClass(controller));
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  gContentScreen = name;
+  gContentScreenTime = now;
+  if (gTappedPost && now - gTappedTime <= kHRTapToScreen) HRMarkOpenedByTap(name);
+}
+
+#pragma mark - Following the feed
+
 // The feed list on screen now, if any. Looks for one at most once a second
 // unless `force` is set.
 static UIScrollView *HRCurrentList(BOOL force) {
   UIWindow *window = HRAppMainWindow();
   if (!window) return nil;
+  HRWatchTaps(window);
   UIScrollView *list = gList;
   if (list && HRVisibleArea(list, window) <= 0) list = nil;
   if (list) return list;

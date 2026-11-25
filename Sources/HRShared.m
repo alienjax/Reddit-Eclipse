@@ -16,7 +16,7 @@ NSString *const HRPrefDiagnostics = @"HRDiagnostics";
 NSString *const HRPrefHintShown = @"HRHintShown2";
 NSString *const HRPrefReadHintShown = @"HRReadHintShown";
 
-NSString *const HRTweakVersion = @"0.0.21b";
+NSString *const HRTweakVersion = @"0.0.27b";
 
 static const NSUInteger kHRMaxLogLines = 400;
 

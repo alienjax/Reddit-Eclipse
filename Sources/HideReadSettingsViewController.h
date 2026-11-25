@@ -20,12 +20,13 @@ void HRInstallSettingsGesture(UIWindow *window);
 /// Same, for the main window of every connected scene.
 void HRInstallSettingsGestures(void);
 
-/// A short message at the top of the screen, gone after `duration` seconds.
-/// Main thread.
+/// A short message at the top of the screen, gone after `duration` seconds. It
+/// replaces any banner or faint note already there. Main thread.
 void HRShowBanner(NSString *text, NSTimeInterval duration);
 
 /// A faint note at the top of the screen that fades in, stays a moment and fades
-/// out (about a second and a half). A newer one replaces it.
+/// out (about a second and a half). A newer one replaces it; none shows while a
+/// banner is up. Main thread.
 void HRShowToast(NSString *text);
 
 /// Shows a one-time banner after the first launch saying how to open settings.

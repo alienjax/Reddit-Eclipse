@@ -31,6 +31,35 @@ BOOL HRIsPostScreenController(UIViewController *controller) {
   return NO;
 }
 
+BOOL HRIsPostContentScreen(UIViewController *controller) {
+  static NSArray<NSString *> *matches;
+  static NSArray<NSString *> *exclusions;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    // A post's video, images or link, full screen.
+    matches = @[
+      @"video", @"player", @"media", @"lightbox", @"gallery", @"image", @"photo", @"theater",
+      @"fullbleed", @"immersive", @"browser", @"webview", @"safari"
+    ];
+    // Other screens a tap on a post card can open.
+    exclusions = @[
+      @"compose", @"reply", @"editor", @"report", @"sheet", @"menu", @"share", @"activity",
+      @"award", @"alert", @"picker", @"subreddit", @"community", @"profile", @"redditor",
+      @"user", @"chat", @"inbox", @"search", @"setting", @"onboarding", @"upload", @"camera",
+      @"avatar", @"login", @"signup", @"auth"
+    ];
+  });
+  if (HRIsPostScreenController(controller)) return YES;
+  NSString *name = NSStringFromClass(object_getClass(controller));
+  if ([name hasPrefix:@"HideRead"]) return NO;  // the tweak's own screens
+  name = name.lowercaseString;
+  for (NSString *exclusion in exclusions)
+    if ([name containsString:exclusion]) return NO;
+  for (NSString *match in matches)
+    if ([name containsString:match]) return YES;
+  return NO;
+}
+
 // Screen-level controllers only, so the diagnostic log isn't flooded with
 // every child controller.
 static BOOL HRIsScreenLevel(UIViewController *controller) {
@@ -42,8 +71,10 @@ static BOOL HRIsScreenLevel(UIViewController *controller) {
 
 void HRScreenTrackerViewWillAppear(UIViewController *controller) {
   BOOL isPostScreen = HRIsPostScreenController(controller);
-  if (isPostScreen || HRIsScreenLevel(controller)) {
+  BOOL screenLevel = isPostScreen || HRIsScreenLevel(controller);
+  if (screenLevel) {
     HRScrollTrackerScreenChanged();
+    HRScrollTrackerScreenAppeared(controller);  // a post card tapped just before counts as opened
     HRHideButtonUpdateLater();  // never from inside Reddit's own callback
   } else if ([controller isKindOfClass:UITabBarController.class]) {
     HRHideButtonUpdateLater();  // Reddit's tab bar is coming on screen
@@ -58,8 +89,11 @@ void HRScreenTrackerViewWillAppear(UIViewController *controller) {
   if (HRPref(HRPrefDiagnostics)) {
     NSString *name = NSStringFromClass(object_getClass(controller));
     // Skips the tweak's own screens (their class names start with HideRead).
-    if (![name hasPrefix:@"HideRead"] && ![name isEqualToString:@"UIViewController"] && (isPostScreen || HRIsScreenLevel(controller)))
-      HRLog(@"[screen] %@%@", name, isPostScreen ? @"  <- post screen" : @"");
+    if (![name hasPrefix:@"HideRead"] && ![name isEqualToString:@"UIViewController"] && screenLevel)
+      HRLog(@"[screen] %@%@", name,
+            isPostScreen                          ? @"  <- post screen"
+            : HRIsPostContentScreen(controller)   ? @"  <- a post's video, images or link"
+                                                  : @"");
   }
 }
 

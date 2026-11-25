@@ -24,7 +24,8 @@ static const NSUInteger kHRMaxWalkDepth = 12;
 @interface HideReadFeedStats : NSObject
 @property (nonatomic) BOOL diagnostics;
 @property (nonatomic) NSUInteger posts;         // visible posts recognised in feed lists
-@property (nonatomic) NSUInteger hidden;        // of those, hidden because they were read
+@property (nonatomic) NSUInteger hidden;        // of those, taken out because they were read
+@property (nonatomic) NSUInteger alreadyHidden; // posts taken out because Reddit marks them hidden
 @property (nonatomic) NSUInteger unrecognized;  // feed items with no single post id
 @property (nonatomic, copy) NSString *unrecognizedSample;
 @property (nonatomic, strong) NSMutableArray<NSString *> *hiddenTitles;  // diagnostics
@@ -200,9 +201,9 @@ static BOOL HRIsAlreadyHidden(NSDictionary *node) {
   return [cells isKindOfClass:NSArray.class] && [(NSArray *)cells count] == 0;
 }
 
-// Hides a feed node the way the app itself treats hidden content: posts get
-// isHidden = true, server-driven units lose their cells. The edge stays in the
-// list, so pagination cursors are untouched.
+// Marks a feed node hidden in place: posts get isHidden = true, server-driven
+// units lose their cells. Only for a list that can't be changed: the Reddit app
+// shows a post marked this way as a "Post hidden / Undo" row.
 static void HRHideNode(NSMutableDictionary *node) {
   if ([node[@"cells"] isKindOfClass:NSArray.class] ||
       [HRTypename(node) isEqualToString:@"CellGroup"])
@@ -229,46 +230,69 @@ static BOOL HRHasMorePages(NSDictionary *container) {
   return YES;  // unknown, so assume there are more
 }
 
+// Takes the read posts out of a feed list, and the posts Reddit marks as hidden
+// on your account: the app would show each of those as a "Post hidden / Undo"
+// row. The list's pageInfo stays as it is, so the next page loads as usual. A
+// page left without a single post could stop the feed from loading more, so
+// when more pages exist and no unread post is left, the last read post stays
+// (or, if Reddit marked them all hidden, the last of those).
 static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadFeedStats *stats) {
   HideReadStore *store = HideReadStore.sharedStore;
-  NSMutableArray<NSMutableDictionary *> *visiblePosts = [NSMutableArray array];
-  NSMutableArray<NSMutableDictionary *> *readPosts = [NSMutableArray array];
+  NSMutableArray<NSNumber *> *readEdges = [NSMutableArray array];    // indexes, in order
+  NSMutableArray<NSNumber *> *hiddenEdges = [NSMutableArray array];
+  NSUInteger visiblePosts = 0;
 
-  for (id edge in edges) {
+  for (NSUInteger i = 0; i < edges.count; i++) {
+    id edge = edges[i];
     if (![edge isKindOfClass:NSDictionary.class]) continue;
     id node = ((NSDictionary *)edge)[@"node"];
-    if (![node isKindOfClass:NSMutableDictionary.class]) continue;
-    if (!HRIsHideableNode(node) || HRIsAlreadyHidden(node)) continue;
+    if (![node isKindOfClass:NSMutableDictionary.class] || !HRIsHideableNode(node)) continue;
     NSString *postID = HRPostIDForNode(node);
+    if (HRIsAlreadyHidden(node)) {
+      if (postID) [hiddenEdges addObject:@(i)];
+      continue;
+    }
     if (!postID) {
       stats.unrecognized++;
       if (stats.diagnostics && !stats.unrecognizedSample)
         stats.unrecognizedSample = HRDescribeNode(node);
       continue;
     }
-    [visiblePosts addObject:node];
+    visiblePosts++;
     if (stats.rememberTitles) HRRememberTitle(postID, node);
-    if ([store containsPostID:postID]) [readPosts addObject:node];
+    if ([store containsPostID:postID]) [readEdges addObject:@(i)];
   }
 
-  stats.posts += visiblePosts.count;
-  if (readPosts.count == 0) return;
+  stats.posts += visiblePosts;
+  if (readEdges.count == 0 && hiddenEdges.count == 0) return;
 
-  // If every post on this page is read and more pages exist, keep the last one
-  // so the feed still has something to scroll to and keeps loading.
-  if (readPosts.count == visiblePosts.count && HRHasMorePages(container))
-    [readPosts removeLastObject];
+  if (readEdges.count == visiblePosts && HRHasMorePages(container)) {
+    if (readEdges.count)
+      [readEdges removeLastObject];
+    else
+      [hiddenEdges removeLastObject];
+  }
 
-  for (NSMutableDictionary *node in readPosts) {
-    if (stats.diagnostics) {
-      if (!stats.hiddenTitles) stats.hiddenTitles = [NSMutableArray array];
-      NSString *postID = HRPostIDForNode(node);
+  if (stats.diagnostics && readEdges.count) {
+    if (!stats.hiddenTitles) stats.hiddenTitles = [NSMutableArray array];
+    for (NSNumber *index in readEdges) {
+      NSString *postID = HRPostIDForNode(edges[index.unsignedIntegerValue][@"node"]);
       NSString *title = HRTitleSuffix(postID);
       [stats.hiddenTitles addObject:title.length ? [title substringFromIndex:1] : postID];
     }
-    HRHideNode(node);
   }
-  stats.hidden += readPosts.count;
+
+  if ([edges isKindOfClass:NSMutableArray.class]) {
+    NSMutableArray<NSNumber *> *out = [readEdges mutableCopy];
+    [out addObjectsFromArray:hiddenEdges];
+    [out sortUsingSelector:@selector(compare:)];
+    for (NSNumber *index in out.reverseObjectEnumerator)  // last first, so the others keep their places
+      [(NSMutableArray *)edges removeObjectAtIndex:index.unsignedIntegerValue];
+    stats.alreadyHidden += hiddenEdges.count;
+  } else {
+    for (NSNumber *index in readEdges) HRHideNode(edges[index.unsignedIntegerValue][@"node"]);
+  }
+  stats.hidden += readEdges.count;
 }
 
 // Keys never descended into: comment trees, and the user's own lists.
@@ -407,9 +431,10 @@ static void HRCollectCommentIDs(id object, NSUInteger depth, NSMutableSet<NSStri
 
 #pragma mark - Titles
 
-// Titles of posts seen in feeds and post pages: the log names posts by them, and
-// the scroll tracker matches the post cards on screen against them. Filled while
-// the log or "You Scroll Past It" is on.
+// Titles of posts seen in feeds and post pages: the log and the notes about
+// hiding name posts by them, and the scroll tracker matches the post cards on
+// screen (scrolled past or tapped) against them. Filled while the log, "You Open
+// It" or "You Scroll Past It" is on.
 static os_unfair_lock gTitleLock = OS_UNFAIR_LOCK_INIT;
 static NSMutableDictionary<NSString *, NSString *> *gTitles;    // post id -> title, for the log
 static NSMutableDictionary<NSString *, NSString *> *gTitleIDs;  // normalized title -> post id
@@ -541,11 +566,17 @@ NSString *HRPostIDForText(NSString *text, BOOL searchInside) {
   return postID;
 }
 
-// " “Title”" for the log, or "" when the title isn't known.
-static NSString *HRTitleSuffix(NSString *postID) {
+NSString *HRPostTitle(NSString *postID) {
+  if (!postID) return nil;
   os_unfair_lock_lock(&gTitleLock);
   NSString *title = gTitles[postID];
   os_unfair_lock_unlock(&gTitleLock);
+  return title;
+}
+
+// " “Title”" for the log, or "" when the title isn't known.
+static NSString *HRTitleSuffix(NSString *postID) {
+  NSString *title = HRPostTitle(postID);
   return title ? [NSString stringWithFormat:@" “%@”", title] : @"";
 }
 
@@ -633,7 +664,7 @@ static void HRRecordReadSignals(NSString *operation, NSDictionary *variables,
         if (![root isKindOfClass:NSDictionary.class]) continue;
         postID = HRPostIDFromValue(((NSDictionary *)root)[@"id"]);
         if (postID) {
-          if (diagnostics || HRPref(HRPrefMarkScrolledPast)) HRRememberTitle(postID, root);
+          if (diagnostics || markOpened || HRPref(HRPrefMarkScrolledPast)) HRRememberTitle(postID, root);
           break;
         }
       }
@@ -842,12 +873,16 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
 
     HideReadFeedStats *stats = [HideReadFeedStats new];
     stats.diagnostics = HRPref(HRPrefDiagnostics);
-    stats.rememberTitles = stats.diagnostics || HRPref(HRPrefMarkScrolledPast);
+    stats.rememberTitles = stats.diagnostics || HRPref(HRPrefMarkOpened) || HRPref(HRPrefMarkScrolledPast);
     HRHideReadPosts(payload, stats);
     atomic_fetch_add(&gFeedPostsSeen, stats.posts);
-    if (stats.posts > 0)
-      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@", name, (unsigned long)stats.hidden,
-            (unsigned long)stats.posts, stats.hiddenTitles.count ? @": " : @"",
+    if (stats.posts > 0 || stats.alreadyHidden > 0)
+      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@", name, (unsigned long)stats.hidden,
+            (unsigned long)stats.posts,
+            stats.alreadyHidden ? [NSString stringWithFormat:@", and took out %lu Reddit marks as hidden",
+                                                             (unsigned long)stats.alreadyHidden]
+                                : @"",
+            stats.hiddenTitles.count ? @": " : @"",
             stats.hiddenTitles.count ? [stats.hiddenTitles componentsJoinedByString:@", "] : @"");
     if (stats.unrecognized > 0)
       HRLog(@"[feed] %@: %lu items without a single post id, e.g. %@", name,
@@ -857,7 +892,7 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
       HRLogOnce([@"empty:" stringByAppendingString:name],
                 @"[feed] %@: no feed items found (top-level fields: %@)", name,
                 [[payload allKeys] componentsJoinedByString:@", "]);
-    if (stats.hidden == 0) return data;
+    if (stats.hidden == 0 && stats.alreadyHidden == 0) return data;
 
     NSData *modified = [NSJSONSerialization dataWithJSONObject:json
                                                        options:NSJSONWritingWithoutEscapingSlashes
