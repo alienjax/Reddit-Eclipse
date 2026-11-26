@@ -1,5 +1,6 @@
 #import "HideReadStore.h"
 #import "HRAccountHider.h"
+#import "HROwnPosts.h"
 #import <os/lock.h>
 
 static const NSTimeInterval kHRMaxAge = 90 * 24 * 60 * 60;
@@ -82,7 +83,7 @@ static const int64_t kHRSaveDelay = 2 * NSEC_PER_SEC;
 }
 
 - (BOOL)markPostID:(NSString *)postID {
-  if (postID.length == 0) return NO;
+  if (postID.length == 0 || HRIsOwnPost(postID)) return NO;  // your own posts never count as read
   NSNumber *now = @(NSDate.date.timeIntervalSince1970);
   os_unfair_lock_lock(&_lock);
   BOOL isNew = _entries[postID] == nil;
@@ -94,6 +95,19 @@ static const int64_t kHRSaveDelay = 2 * NSEC_PER_SEC;
   [self scheduleSave];
   if (isNew) HRAccountHiderQueue(postID);  // and on your Reddit account, if that's on
   return isNew;
+}
+
+- (NSArray<NSString *> *)removePostIDs:(NSArray<NSString *> *)postIDs {
+  NSMutableArray<NSString *> *removed = [NSMutableArray array];
+  os_unfair_lock_lock(&_lock);
+  for (NSString *postID in postIDs) {
+    if (!_entries[postID]) continue;
+    [_entries removeObjectForKey:postID];
+    [removed addObject:postID];
+  }
+  os_unfair_lock_unlock(&_lock);
+  if (removed.count) [self scheduleSave];
+  return removed;
 }
 
 - (NSUInteger)count {

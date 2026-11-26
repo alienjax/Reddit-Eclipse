@@ -15,7 +15,9 @@
 //
 // A card that was on screen and has since gone above the top of the list was
 // scrolled past, which counts as read straight away while "You Scroll Past It" is
-// on: the post is left out of every feed that loads from then on. Now and then,
+// on: the post is left out of every feed that loads from then on. So does every
+// post the feed lists above the topmost card on screen, however fast it went by,
+// even one never seen here (HRTakePostsListedBefore). Now and then,
 // once the list comes to rest, a faint note at the top says how many posts were
 // hidden while you browsed: scrolled past, or (with "It Stays on Screen" on)
 // counted while still on screen. While "“Posts Hidden” Note" is on.
@@ -275,12 +277,13 @@ void HRScrollTrackerPostHidden(void) {
   });
 }
 
-static void HRMarkScrolledPast(NSString *postID) {
+static void HRMarkScrolledPast(NSString *postID, BOOL listedAbove) {
   if (![HideReadStore.sharedStore markPostID:postID]) return;
   gScrolledPastThisRun++;
   gWatchCounted++;
   HRCountHidden();
-  HRLog(@"[read] %@ scrolled past", HRDescribePost(postID));
+  HRLog(@"[read] %@ scrolled past%@", HRDescribePost(postID),
+        listedAbove ? @" (listed above the cards on screen)" : @"");
   HRShowReadHintIfNeeded();
 }
 
@@ -340,6 +343,9 @@ static void HRWatchList(UIScrollView *list) {
 
   BOOL markScrolledPast = HRPref(HRPrefMarkScrolledPast);
   NSMutableSet<NSString *> *listed = [NSMutableSet set];
+  NSMutableArray<NSString *> *onScreen = [NSMutableArray array];  // cards at least partly on screen
+  NSString *topmost = nil;                                         // the highest of them
+  CGFloat topmostY = CGFLOAT_MAX;
   NSUInteger cellCount = 0;
   for (UIView *cell in HRVisibleCells(list)) {
     // Small rows count too: a feed can give a post's title a row of its own.
@@ -353,16 +359,30 @@ static void HRWatchList(UIScrollView *list) {
     if (shown >= MIN(kHRSeenMinimum, frame.size.height * 0.5)) {
       gSeen[postID] = [NSValue valueWithCGRect:frame];
     } else if (gSeen[postID] && CGRectGetMaxY(frame) <= top) {
-      if (markScrolledPast) HRMarkScrolledPast(postID);
+      if (markScrolledPast) HRMarkScrolledPast(postID, NO);
       [gSeen removeObjectForKey:postID];
+    }
+    if (CGRectGetMaxY(frame) > top && CGRectGetMinY(frame) < bottom) {
+      [onScreen addObject:postID];
+      if (CGRectGetMinY(frame) < topmostY) {
+        topmostY = CGRectGetMinY(frame);
+        topmost = postID;
+      }
     }
   }
   // Cards that have left the list's visible cells since they were on screen:
   // scrolled past if they're above the top now, otherwise (scrolled back up) not.
   for (NSString *postID in gSeen.allKeys) {
     if ([listed containsObject:postID]) continue;
-    if (CGRectGetMaxY(gSeen[postID].CGRectValue) <= top && markScrolledPast) HRMarkScrolledPast(postID);
+    if (CGRectGetMaxY(gSeen[postID].CGRectValue) <= top && markScrolledPast) HRMarkScrolledPast(postID, NO);
     [gSeen removeObjectForKey:postID];
+  }
+  // Every post the feed lists above the topmost card still on screen was
+  // scrolled past, however fast it went by: even one never seen here. The cards
+  // below it say which list it is.
+  if (markScrolledPast && topmost) {
+    [onScreen removeObject:topmost];
+    for (NSString *postID in HRTakePostsListedBefore(topmost, onScreen)) HRMarkScrolledPast(postID, YES);
   }
 
   // Diagnostics: a summary every 1,500 points of scrolling (or 5 seconds of it).

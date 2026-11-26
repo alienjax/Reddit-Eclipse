@@ -30,6 +30,12 @@ NSString *_Nullable HRPostIDForText(NSString *_Nullable text, BOOL searchInside)
 /// (shortened to 60 characters), or nil. Any thread.
 NSString *_Nullable HRPostTitle(NSString *_Nullable postID);
 
+/// The posts listed above `postID` in the feed list it's in, as Jax Reddit
+/// Eclipse handed that list to the app, which haven't been taken before: the
+/// list is the one in which posts in `below` (cards on screen under it) come
+/// after it, and there must be one. Each is handed out once. Any thread.
+NSArray<NSString *> *HRTakePostsListedBefore(NSString *postID, NSArray<NSString *> *below);
+
 /// Posts seen in feed responses since Reddit opened, read or not. Any thread.
 NSUInteger HRFeedPostsSeenCount(void);
 

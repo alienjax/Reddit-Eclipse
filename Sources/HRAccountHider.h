@@ -13,6 +13,14 @@ void HRAccountHiderNoteRequest(NSURLSession *session, NSURLRequest *request);
 /// A post newly counted as read: queued to be hidden on your account. Any thread.
 void HRAccountHiderQueue(NSString *postID);
 
+/// YES if Jax Reddit Eclipse hid `postID` on your account (it's on the record).
+/// Any thread; cheap.
+BOOL HRAccountHiderHid(NSString *_Nullable postID);
+
+/// Posts found to be yours (see HROwnPosts.h): never hidden on your account,
+/// and any Jax Reddit Eclipse hid there before are unhidden. Any thread.
+void HRAccountHiderOwnPosts(NSArray<NSString *> *postIDs);
+
 /// Call when the app becomes active: sends what's still waiting (from the last
 /// time Reddit was open, too).
 void HRAccountHiderStart(void);

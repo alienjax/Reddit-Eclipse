@@ -1,6 +1,6 @@
 Package: com.jax.reddit-eclipse
 Name: Jax Reddit Eclipse
-Version: 0.0.27b
+Version: 0.0.29b
 Architecture: iphoneos-arm
 Description: Hides posts you've already read in the official Reddit app.
 Maintainer: Your Name <you@example.com>

@@ -144,7 +144,7 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
         @{@"title" : @"Hide Button in Tab Bar", @"pref" : HRPrefHideButton, @"kind" : @(HRRowKindSwitch)},
         @{@"title" : @"“Posts Hidden” Note", @"pref" : HRPrefHiddenNote, @"kind" : @(HRRowKindSwitch)},
       ],
-      @"footer" : @"Read posts are left out whenever a feed loads. Tap Hide to hide all your read "
+      @"footer" : @"Read posts are left out whenever a feed loads, but never your own. Tap Hide to hide all your read "
                   @"posts on your Reddit account; touch and hold it for these settings. With the "
                   @"button off, double-tap with two fingers instead. The note shows how many posts "
                   @"you scrolled past were hidden.",
