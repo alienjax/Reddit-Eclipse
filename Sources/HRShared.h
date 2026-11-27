@@ -8,6 +8,7 @@ extern NSString *const HRPrefEnabled;         // hide read posts in feeds
 extern NSString *const HRPrefMarkOpened;      // a post you open counts as read
 extern NSString *const HRPrefMarkLingered;    // a post that stays on screen counts as read
 extern NSString *const HRPrefMarkScrolledPast; // a post you scroll past counts as read
+extern NSString *const HRPrefMarkCrossposts;  // a crosspost of a post you read counts as read
 extern NSString *const HRPrefHideButton;      // show the Hide button in the tab bar
 extern NSString *const HRPrefHideOnAccount;   // also hide read posts on your Reddit account
 extern NSString *const HRPrefHiddenNote;      // the faint "N posts hidden" note

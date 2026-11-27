@@ -27,6 +27,7 @@ static const NSUInteger kHRMaxWalkDepth = 12;
 @property (nonatomic) BOOL diagnostics;
 @property (nonatomic) NSUInteger posts;         // visible posts recognised in feed lists
 @property (nonatomic) NSUInteger hidden;        // of those, taken out because they were read
+@property (nonatomic) NSUInteger crossposts;    // of those, crossposts of posts you've read
 @property (nonatomic) NSUInteger alreadyHidden; // posts taken out because Reddit marks them hidden
 @property (nonatomic) NSUInteger unrecognized;  // feed items with no single post id
 @property (nonatomic, copy) NSString *unrecognizedSample;
@@ -248,6 +249,92 @@ static BOOL HRShowHiddenNode(NSMutableDictionary *node) {
   return YES;
 }
 
+#pragma mark - Crossposts
+
+// Whether a key or a type names the post a crosspost shares (crosspostRoot,
+// crosspost_parent, a crosspost card), rather than posts sharing this one
+// ("crossposts") or something else about crossposting (crosspostCount,
+// isCrosspostable, where-to-crosspost suggestions).
+static BOOL HRNamesSharedPost(id name) {
+  if (![name isKindOfClass:NSString.class]) return NO;
+  NSString *lowered = ((NSString *)name).lowercaseString;
+  return [lowered containsString:@"crosspost"] && ![lowered containsString:@"crossposts"] &&
+         ![lowered containsString:@"suggest"] && ![lowered containsString:@"count"] &&
+         ![lowered hasPrefix:@"is"] && ![lowered hasPrefix:@"can"];
+}
+
+// The posts a crosspost shares: its original, and for a crosspost of a crosspost
+// the one in between. They're the post ids under a key, or inside an object, that
+// names the shared post, anywhere in the post's feed item. Never the post itself;
+// empty for a post that isn't a crosspost.
+static NSOrderedSet<NSString *> *HRSharedPostIDs(NSDictionary *node, NSString *postID) {
+  NSMutableOrderedSet<NSString *> *found = [NSMutableOrderedSet orderedSet];
+  NSMutableArray<NSArray *> *queue = [NSMutableArray arrayWithObject:@[ node, @0, @NO ]];
+  for (NSUInteger head = 0; head < queue.count && head < 600 && found.count < 4; head++) {
+    NSArray *entry = queue[head];
+    id object = entry[0];
+    NSUInteger depth = [entry[1] unsignedIntegerValue];
+    BOOL shared = [entry[2] boolValue];  // inside the shared post's part
+    if ([object isKindOfClass:NSDictionary.class]) {
+      NSDictionary *dict = object;
+      if (!shared && HRNamesSharedPost(HRTypename(dict))) shared = YES;
+      for (id key in dict) {
+        id value = dict[key];
+        BOOL inside = shared || HRNamesSharedPost(key);
+        NSString *other = inside ? HRPostIDFromValue(value) : nil;
+        if (other) [found addObject:other];
+        if (depth < 6 && ([value isKindOfClass:NSDictionary.class] || [value isKindOfClass:NSArray.class]))
+          [queue addObject:@[ value, @(depth + 1), @(inside) ]];
+      }
+    } else if ([object isKindOfClass:NSArray.class]) {
+      for (id value in (NSArray *)object) {
+        NSString *other = shared ? HRPostIDFromValue(value) : nil;
+        if (other) [found addObject:other];
+        if (depth < 6 && ([value isKindOfClass:NSDictionary.class] || [value isKindOfClass:NSArray.class]))
+          [queue addObject:@[ value, @(depth + 1), @(shared) ]];
+      }
+    }
+  }
+  if (postID) [found removeObject:postID];
+  return found;
+}
+
+// "It’s a Crosspost of a Read Post": whether a feed post is a crosspost of a post
+// you've read. Then it counts as read itself, so it also goes on your account and
+// stays out wherever read posts do.
+static BOOL HRSharesReadPost(NSDictionary *node, NSString *postID, HideReadFeedStats *stats) {
+  NSOrderedSet<NSString *> *shared = HRSharedPostIDs(node, postID);
+  if (shared.count == 0) {
+    // A server-driven unit with another post's id in its cells may be a crosspost
+    // whose card isn't named as one: shown in the log, so it can be recognised.
+    id cells = node[@"cells"];
+    if (stats.diagnostics && [cells isKindOfClass:NSArray.class]) {
+      NSMutableOrderedSet<NSString *> *ids = [HRPostIDsInside(cells, 5, NO, 3) mutableCopy];
+      [ids removeObject:postID];
+      if (ids.count)
+        HRLogOnce(@"crosspost-unnamed", @"[crosspost] %@ has another post's id (%@) in its cells: %@",
+                  HRDescribePost(postID), ids.firstObject, HRDescribeNode(node));
+    }
+    return NO;
+  }
+  HideReadStore *store = HideReadStore.sharedStore;
+  NSString *read = nil;
+  for (NSString *other in shared) {
+    if ([store containsPostID:other]) {
+      read = other;
+      break;
+    }
+  }
+  if (stats.diagnostics)
+    HRLogOnce([@"crosspost:" stringByAppendingString:postID], @"[crosspost] %@ shares %@%@",
+              HRDescribePost(postID), HRDescribePost(read ?: shared.firstObject),
+              read ? @", which you've read: counted as read" : @", not read yet");
+  if (!read) return NO;
+  [store markPostID:postID];
+  stats.crossposts++;
+  return YES;
+}
+
 // Takes the read posts out of a feed list, and the posts Reddit marks as hidden
 // on your account: the app would show each of those as a "Post hidden / Undo"
 // row. Your own posts stay; one of yours Jax Reddit Eclipse hid before (it's
@@ -257,6 +344,7 @@ static BOOL HRShowHiddenNode(NSMutableDictionary *node) {
 // last read one, else the last hidden one, shown as a post where it can be.
 static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadFeedStats *stats) {
   HideReadStore *store = HideReadStore.sharedStore;
+  BOOL crossposts = HRPref(HRPrefMarkCrossposts);
   NSMutableArray<NSNumber *> *readEdges = [NSMutableArray array];    // indexes, in order
   NSMutableArray<NSNumber *> *hiddenEdges = [NSMutableArray array];
   NSUInteger visiblePosts = 0;
@@ -283,7 +371,9 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
     }
     visiblePosts++;
     if (stats.rememberTitles) HRRememberTitle(postID, node);
-    if (!own && [store containsPostID:postID]) [readEdges addObject:@(i)];
+    if (own) continue;
+    if ([store containsPostID:postID] || (crossposts && HRSharesReadPost(node, postID, stats)))
+      [readEdges addObject:@(i)];
   }
 
   stats.posts += visiblePosts;
@@ -1009,8 +1099,11 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
                   @"[feed] %@ still marks %lu posts hidden by Jax Reddit Eclipse as hidden", name, (unsigned long)left);
     }
     if (stats.posts > 0 || stats.alreadyHidden > 0)
-      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@", name, (unsigned long)stats.hidden,
+      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@%@", name, (unsigned long)stats.hidden,
             (unsigned long)stats.posts,
+            stats.crossposts ? [NSString stringWithFormat:@" (%lu crossposts of posts you've read)",
+                                                          (unsigned long)stats.crossposts]
+                             : @"",
             stats.alreadyHidden ? [NSString stringWithFormat:@", and took out %lu Reddit marks as hidden",
                                                              (unsigned long)stats.alreadyHidden]
                                 : @"",

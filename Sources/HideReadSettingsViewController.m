@@ -176,11 +176,17 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
           @"pref" : HRPrefMarkLingered,
           @"kind" : @(HRRowKindSwitch)
         },
+        @{
+          @"title" : @"It’s a Crosspost of a Read Post",
+          @"pref" : HRPrefMarkCrossposts,
+          @"kind" : @(HRRowKindSwitch)
+        },
       ],
       @"footer" : @"“You Open It” includes opening a post’s video, images or link full screen. A "
                   @"post you scroll past stays in the list until the feed reloads. “It Stays on "
                   @"Screen” counts a post visible for a few seconds, using Reddit’s own comment "
-                  @"preloading.",
+                  @"preloading. “It’s a Crosspost of a Read Post” leaves out a crosspost when you’ve "
+                  @"read the post it shares.",
     },
     @{
       @"header" : @"Also Hide Read Posts In",
