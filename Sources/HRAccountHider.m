@@ -111,6 +111,7 @@ static NSUInteger gBackgroundSends;  // requests sent in that time, for the log
 static UIBackgroundTaskIdentifier gQueueBackgroundTask;  // the time that's for (set up as UIBackgroundTaskInvalid)
 
 static NSMutableDictionary<NSString *, NSString *> *gAccountForSignIn;  // sign-in -> your account (memory only)
+static NSMutableArray<NSString *> *gRefusedSignIns;  // sign-ins Reddit turned down, not used again (memory only)
 static NSString *gListedAccount;          // the account whose newest posts were listed last
 static CFAbsoluteTime gOwnListedAt;       // when
 static NSMutableOrderedSet<NSString *> *gUnhide;   // your posts hidden here before: unhidden
@@ -299,6 +300,7 @@ static void HRSetUp(void) {
     gPending = [NSMutableOrderedSet orderedSet];
     gBulk = [NSMutableOrderedSet orderedSet];
     gAccountForSignIn = [NSMutableDictionary dictionary];
+    gRefusedSignIns = [NSMutableArray array];
     gUnhide = [NSMutableOrderedSet orderedSet];
     gToCheck = [NSMutableOrderedSet orderedSet];
     gRecord = [NSMutableDictionary dictionary];
@@ -391,7 +393,12 @@ static NSString *HRAnswerExcerpt(NSData *data) {
   if (!text.length) return @"";
   text = [[text componentsSeparatedByCharactersInSet:NSCharacterSet.newlineCharacterSet]
       componentsJoinedByString:@" "];
-  return [@": " stringByAppendingString:text.length > 120 ? [text substringToIndex:120] : text];
+  return [@": " stringByAppendingString:text.length > 200 ? [text substringToIndex:200] : text];
+}
+
+// A short tag telling the app's sign-ins apart in the log (never the sign-in itself).
+static NSString *HRSignInTag(NSString *authorization) {
+  return [NSString stringWithFormat:@"#%04lx", (unsigned long)(authorization.hash & 0xffff)];
 }
 
 // Reddit's rate-limit headers: requests left in this window, and seconds until
@@ -548,9 +555,16 @@ static void HRHandleFailure(NSArray<NSString *> *batch, NSURLResponse *response,
                             NSString *authorization) {
   NSInteger status = HRStatusCode(response);
   NSString *reason = error ? error.localizedDescription
-                           : [NSString stringWithFormat:@"HTTP %ld%@", (long)status, HRAnswerExcerpt(data)];
+                           : [NSString stringWithFormat:@"HTTP %ld from %@ with sign-in %@%@", (long)status,
+                                                        response.URL.path ?: @"?", HRSignInTag(authorization),
+                                                        HRAnswerExcerpt(data)];
   if (status == 401 || status == 403) {
-    // The sign-in may have run out: the app's next request brings a new one.
+    // That sign-in won't do: it may have run out, or not be your account's (the app
+    // can send others). It isn't used again; the app's next request brings another.
+    if (authorization.length && ![gRefusedSignIns containsObject:authorization]) {
+      [gRefusedSignIns addObject:authorization];
+      if (gRefusedSignIns.count > 8) [gRefusedSignIns removeObjectAtIndex:0];
+    }
     if ([gAuthorization isEqualToString:authorization]) gAuthorization = nil;
     gToldWaiting = NO;
     gProblem = [NSString stringWithFormat:@"Reddit turned down the app’s sign-in (HTTP %ld).", (long)status];
@@ -966,7 +980,9 @@ static NSString *HRStatusLine(void) {
   if (gStopped)
     [parts addObject:@"Stopped: Reddit refused the app’s sign-in three times. Reopen Reddit to retry."];
   else if (waiting && !gAuthorization)
-    [parts addObject:@"Waiting for the app’s sign-in, picked up when a feed loads."];
+    [parts addObject:gProblem ? [gProblem stringByAppendingString:@" Waiting for the app’s next sign-in, picked up "
+                                                                  @"when a feed loads."]
+                              : @"Waiting for the app’s sign-in, picked up when a feed loads."];
   else if (gProblem && waiting && gNextAllowed > now + 1)
     [parts addObject:[gProblem stringByAppendingFormat:@" Trying again in %.0f seconds.", gNextAllowed - now]];
   else if (gProblem)
@@ -1007,8 +1023,10 @@ NSDictionary<NSString *, id> *HRAccountHiderStatus(void) {
 #pragma mark - Entry points
 
 void HRAccountHiderNoteRequest(NSURLSession *session, NSURLRequest *request) {
+  // Only from Reddit's API hosts (gql…, oauth…), the ones the hiding requests go
+  // to: other Reddit hosts can carry other kinds of sign-in.
+  if (!HRShouldProcessRequest(request)) return;
   NSString *host = request.URL.host;
-  if (!HRIsRedditHost(host)) return;
   if (gSession && session == gSession) return;  // our own
   NSString *authorization = [request valueForHTTPHeaderField:@"Authorization"];
   NSDictionary *extra = nil;
@@ -1025,16 +1043,27 @@ void HRAccountHiderNoteRequest(NSURLSession *session, NSURLRequest *request) {
     if (!extra) extra = session.configuration.HTTPAdditionalHeaders;
     if ([extra[@"User-Agent"] isKindOfClass:NSString.class]) agent = extra[@"User-Agent"];
   }
+  NSString *path = request.URL.path ?: @"";
+  NSMutableSet<NSString *> *headerNames = [NSMutableSet set];
+  if (HRPref(HRPrefDiagnostics)) {
+    for (NSString *name in request.allHTTPHeaderFields) [headerNames addObject:name.lowercaseString];
+    for (id name in session.configuration.HTTPAdditionalHeaders)
+      if ([name isKindOfClass:NSString.class]) [headerNames addObject:((NSString *)name).lowercaseString];
+  }
   HRSetUp();
   dispatch_async(gQueue, ^{
     if (agent.length) gUserAgent = agent;
-    if ([authorization isEqualToString:gAuthorization]) return;
+    if ([authorization isEqualToString:gAuthorization] || [gRefusedSignIns containsObject:authorization]) return;
     BOOL first = !gAuthorization;
     gAuthorization = authorization;
-    if (first) {
-      HRLog(@"[account] picked up the Reddit app's sign-in (from a request to %@)", host);
-      HRStatusChanged();
-    }
+    // Each sign-in once, with where it came from: the app may use more than one.
+    HRLogOnce([@"signin:" stringByAppendingString:HRSignInTag(authorization)],
+              @"[account] using the Reddit app's sign-in %@ (from a request to %@%@)", HRSignInTag(authorization),
+              host, path);
+    if (headerNames.count)
+      HRLogOnce(@"signin-headers", @"[account] the app's requests carry these headers: %@",
+                [[headerNames.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]);
+    if (first) HRStatusChanged();
     HRConsiderSending();
   });
 }
@@ -1208,6 +1237,7 @@ void HRAccountHiderHideAllRead(BOOL showNote) {
   dispatch_async(gQueue, ^{
     gStopped = NO;
     gRefusals = 0;
+    [gRefusedSignIns removeAllObjects];  // you asked to try again: every sign-in gets another go
     gBulkToldProblem = NO;
     if (!gBulkTotal) {
       gBulkDone = gBulkHidden = 0;
