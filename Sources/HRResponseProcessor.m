@@ -461,9 +461,9 @@ static BOOL HRSortedByTop(id variables, NSUInteger depth) {
 // 0 when it's off, or for a feed sorted by Top or Controversial, where old posts are
 // what you asked for.
 static NSTimeInterval HRPostedCutoff(NSDictionary *variables) {
-  NSInteger days = [NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays];
-  if (days <= 0 || HRSortedByTop(variables, 0)) return 0;
-  return NSDate.date.timeIntervalSince1970 - (NSTimeInterval)days * 86400;
+  double days = [NSUserDefaults.standardUserDefaults doubleForKey:HRPrefHideOlderThanDays];  // 0.5: 12 hours
+  if (!(days > 0) || HRSortedByTop(variables, 0)) return 0;
+  return NSDate.date.timeIntervalSince1970 - days * 86400;
 }
 
 // A feed item's type and keys, and its cells' (diagnostics).
@@ -1272,9 +1272,9 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
             stats.crossposts ? [NSString stringWithFormat:@" (%lu crossposts of posts you've read)",
                                                           (unsigned long)stats.crossposts]
                              : @"",
-            stats.old ? [NSString stringWithFormat:@" (%lu older than %ld days)", (unsigned long)stats.old,
-                                                   (long)[NSUserDefaults.standardUserDefaults
-                                                       integerForKey:HRPrefHideOlderThanDays]]
+            stats.old ? [NSString stringWithFormat:@" (%lu older than %@)", (unsigned long)stats.old,
+                                                   HROlderThanTitle([NSUserDefaults.standardUserDefaults
+                                                       doubleForKey:HRPrefHideOlderThanDays]).lowercaseString]
                       : @"",
             stats.alreadyHidden ? [NSString stringWithFormat:@", and took out %lu Reddit marks as hidden",
                                                              (unsigned long)stats.alreadyHidden]

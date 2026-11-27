@@ -18,7 +18,7 @@ NSString *const HRPrefDiagnostics = @"HRDiagnostics";
 NSString *const HRPrefHintShown = @"HRHintShown2";
 NSString *const HRPrefReadHintShown = @"HRReadHintShown";
 
-NSString *const HRTweakVersion = @"0.0.31b";
+NSString *const HRTweakVersion = @"0.0.32b";
 
 static const NSUInteger kHRMaxLogLines = 400;
 
@@ -47,6 +47,25 @@ void HRRegisterDefaults(void) {
 
 BOOL HRPref(NSString *key) {
   return [NSUserDefaults.standardUserDefaults boolForKey:key];
+}
+
+NSString *HROlderThanTitle(double days) {
+  if (!(days > 0)) return @"Off";
+  if (days < 1) {
+    long hours = (long)(days * 24 + 0.5);
+    return hours == 1 ? @"1 Hour" : [NSString stringWithFormat:@"%ld Hours", hours];
+  }
+  long whole = (long)(days + 0.5);
+  switch (whole) {
+    case 1: return @"1 Day";
+    case 7: return @"1 Week";
+    case 14: return @"2 Weeks";
+    case 30: return @"1 Month";
+    case 90: return @"3 Months";
+    case 180: return @"6 Months";
+    case 365: return @"1 Year";
+    default: return [NSString stringWithFormat:@"%ld Days", whole];
+  }
 }
 
 void HRLog(NSString *format, ...) {

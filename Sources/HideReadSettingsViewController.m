@@ -26,23 +26,13 @@ static NSString *HRFormatted(NSUInteger count) {
 
 #pragma mark - Hide Posts Older Than
 
-// The ages to choose from, in days (0: off).
+// The ages to choose from, in days (0: off; 0.5: 12 hours).
 static NSArray<NSNumber *> *HROlderThanChoices(void) {
-  return @[ @0, @1, @2, @3, @5, @7, @14, @30, @90, @180, @365 ];
+  return @[ @0, @0.5, @1, @2, @3, @5, @7, @14, @30, @90, @180, @365 ];
 }
 
-static NSString *HROlderThanTitle(NSInteger days) {
-  switch (days) {
-    case 0: return @"Off";
-    case 1: return @"1 Day";
-    case 7: return @"1 Week";
-    case 14: return @"2 Weeks";
-    case 30: return @"1 Month";
-    case 90: return @"3 Months";
-    case 180: return @"6 Months";
-    case 365: return @"1 Year";
-    default: return [NSString stringWithFormat:@"%ld Days", (long)days];
-  }
+static double HROlderThanDays(void) {
+  return [NSUserDefaults.standardUserDefaults doubleForKey:HRPrefHideOlderThanDays];
 }
 
 static NSString *const HROlderThanFooter =
@@ -70,19 +60,20 @@ static NSString *const HROlderThanFooter =
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
   UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
-  NSInteger days = HROlderThanChoices()[(NSUInteger)indexPath.row].integerValue;
+  double days = HROlderThanChoices()[(NSUInteger)indexPath.row].doubleValue;
   UIListContentConfiguration *content = [UIListContentConfiguration cellConfiguration];
   content.text = HROlderThanTitle(days);
   cell.contentConfiguration = content;
-  BOOL chosen = days == [NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays];
+  double difference = days - HROlderThanDays();
+  BOOL chosen = difference < 0.001 && difference > -0.001;
   cell.accessoryType = chosen ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
   return cell;
 }
 
 - (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
   [tableView deselectRowAtIndexPath:indexPath animated:YES];
-  NSInteger days = HROlderThanChoices()[(NSUInteger)indexPath.row].integerValue;
-  [NSUserDefaults.standardUserDefaults setInteger:days forKey:HRPrefHideOlderThanDays];
+  double days = HROlderThanChoices()[(NSUInteger)indexPath.row].doubleValue;
+  [NSUserDefaults.standardUserDefaults setDouble:days forKey:HRPrefHideOlderThanDays];
   HRLog(@"[old] Hide Posts Older Than: %@", HROlderThanTitle(days));
   for (UITableViewCell *cell in tableView.visibleCells) {
     NSIndexPath *path = [tableView indexPathForCell:cell];
@@ -517,7 +508,7 @@ static UIImage *HRFadeMask(CGFloat height, CGFloat fade) {
       content = [UIListContentConfiguration valueCellConfiguration];
       content.text = row[@"title"];
       content.secondaryText =
-          HROlderThanTitle([NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays]);
+          HROlderThanTitle(HROlderThanDays());
       cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
       break;
     case HRRowKindLink:

@@ -9,7 +9,7 @@ extern NSString *const HRPrefMarkOpened;      // a post you open counts as read
 extern NSString *const HRPrefMarkLingered;    // a post that stays on screen counts as read
 extern NSString *const HRPrefMarkScrolledPast; // a post you scroll past counts as read
 extern NSString *const HRPrefMarkCrossposts;  // a crosspost of a post you read counts as read
-extern NSString *const HRPrefHideOlderThanDays; // leave out posts older than this many days (0: off)
+extern NSString *const HRPrefHideOlderThanDays; // leave out posts older than this many days, 0.5 for 12 hours (0: off)
 extern NSString *const HRPrefHideButton;      // show the Hide button in the tab bar
 extern NSString *const HRPrefHideOnAccount;   // also hide read posts on your Reddit account
 extern NSString *const HRPrefHiddenNote;      // the faint "N posts hidden" note
@@ -23,6 +23,8 @@ extern NSString *const HRTweakVersion;
 
 void HRRegisterDefaults(void);
 BOOL HRPref(NSString *key);
+// A Hide Posts Older Than age as Settings shows it ("12 Hours", "3 Days", "1 Week"; "Off" for 0).
+NSString *HROlderThanTitle(double days);
 
 // Diagnostic log: a ring buffer shown in the settings screen, mirrored to the
 // system log. Does nothing unless the Diagnostic Log setting is on.
