@@ -28,6 +28,8 @@ static const NSUInteger kHRMaxWalkDepth = 12;
 @property (nonatomic) NSUInteger posts;         // visible posts recognised in feed lists
 @property (nonatomic) NSUInteger hidden;        // of those, taken out because they were read
 @property (nonatomic) NSUInteger crossposts;    // of those, crossposts of posts you've read
+@property (nonatomic) NSUInteger old;           // of those, posts older than Hide Posts Older Than
+@property (nonatomic) NSTimeInterval postedBefore;  // posts from before this are left out (0: none are)
 @property (nonatomic) NSUInteger alreadyHidden; // posts taken out because Reddit marks them hidden
 @property (nonatomic) NSUInteger unrecognized;  // feed items with no single post id
 @property (nonatomic, copy) NSString *unrecognizedSample;
@@ -335,6 +337,170 @@ static BOOL HRSharesReadPost(NSDictionary *node, NSString *postID, HideReadFeedS
   return YES;
 }
 
+#pragma mark - Old posts
+
+// Days since 1970-01-01 for a date (proleptic Gregorian calendar).
+static long long HRDaysFromCivil(long long year, int month, int day) {
+  year -= month <= 2;
+  long long era = (year >= 0 ? year : year - 399) / 400;
+  long long yearOfEra = year - era * 400;
+  long long dayOfYear = (153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1;
+  long long dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear;
+  return era * 146097 + dayOfEra - 719468;
+}
+
+// The number written by `count` digits from c[at].
+static int HRDigits(const unichar *c, NSUInteger at, NSUInteger count) {
+  int number = 0;
+  for (NSUInteger d = 0; d < count; d++) number = number * 10 + (c[at + d] - '0');
+  return number;
+}
+
+// Seconds since 1970 for a time Reddit sends: ISO 8601 text
+// ("2025-11-27T10:05:33.123000+0000", "…Z", "…+00:00"), or a number of seconds
+// (created_utc) or milliseconds. 0 if it's neither.
+static NSTimeInterval HRTimeFromValue(id value) {
+  if ([value isKindOfClass:NSNumber.class]) {
+    double seconds = [value doubleValue];
+    if (seconds > 1e11) seconds /= 1000;  // milliseconds
+    return seconds > 1e9 ? seconds : 0;   // later than 2001
+  }
+  if (![value isKindOfClass:NSString.class]) return 0;
+  NSString *text = value;
+  unichar c[48] = {0};
+  NSUInteger length = MIN(text.length, (NSUInteger)48);
+  if (length < 19) return 0;
+  [text getCharacters:c range:NSMakeRange(0, length)];
+  static const NSUInteger digitAt[] = {0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18};
+  for (NSUInteger k = 0; k < sizeof(digitAt) / sizeof(digitAt[0]); k++)
+    if (c[digitAt[k]] < '0' || c[digitAt[k]] > '9') return 0;
+  if (c[4] != '-' || c[7] != '-' || (c[10] != 'T' && c[10] != ' ') || c[13] != ':' || c[16] != ':') return 0;
+  int year = HRDigits(c, 0, 4), month = HRDigits(c, 5, 2), day = HRDigits(c, 8, 2);
+  int hour = HRDigits(c, 11, 2), minute = HRDigits(c, 14, 2), second = HRDigits(c, 17, 2);
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59 || second > 60) return 0;
+  NSUInteger i = 19;
+  if (i < length && c[i] == '.')
+    for (i++; i < length && c[i] >= '0' && c[i] <= '9'; i++) {
+    }  // fractions of a second
+  long offset = 0;  // the time zone's, in seconds east of UTC
+  if (i < length && (c[i] == '+' || c[i] == '-')) {
+    NSUInteger at = i + 1;
+    if (at + 2 > length || c[at] < '0' || c[at] > '9' || c[at + 1] < '0' || c[at + 1] > '9') return 0;
+    int zoneHours = HRDigits(c, at, 2), zoneMinutes = 0;
+    at += 2;
+    if (at < length && c[at] == ':') at++;
+    if (at + 2 <= length && c[at] >= '0' && c[at] <= '9' && c[at + 1] >= '0' && c[at + 1] <= '9')
+      zoneMinutes = HRDigits(c, at, 2);
+    offset = (zoneHours * 3600 + zoneMinutes * 60) * (c[i] == '-' ? -1 : 1);
+  }
+  long long days = HRDaysFromCivil(year, month, day);
+  return (NSTimeInterval)(days * 86400 + hour * 3600 + minute * 60 + second - offset);
+}
+
+// A "created…" or "posted…" time among a dictionary's own keys, or 0.
+static NSTimeInterval HRPostedTimeIn(NSDictionary *dict) {
+  for (id key in dict) {
+    if (![key isKindOfClass:NSString.class]) continue;
+    NSString *lowered = ((NSString *)key).lowercaseString;
+    if (![lowered hasPrefix:@"created"] && ![lowered hasPrefix:@"posted"]) continue;
+    NSTimeInterval time = HRTimeFromValue(dict[key]);
+    if (time > 0) return time;
+  }
+  return 0;
+}
+
+// When a feed post was posted (seconds since 1970), or 0 if its feed item doesn't
+// say. Looked for in the item itself, a post inside it, and a server-driven unit's
+// cells and the cells inside those (the classic layout's metadataCell), but no
+// deeper (an author's or a community's createdAt is further in), and never in a
+// crossposted post's card.
+static NSTimeInterval HRPostedTime(NSDictionary *node) {
+  NSTimeInterval posted = HRPostedTimeIn(node);
+  if (posted > 0) return posted;
+  for (NSString *key in @[ @"post", @"postInfo" ]) {
+    id inner = node[key];
+    if ([inner isKindOfClass:NSDictionary.class] && (posted = HRPostedTimeIn(inner)) > 0) return posted;
+  }
+  id cells = node[@"cells"];
+  if (![cells isKindOfClass:NSArray.class]) return 0;
+  for (id cell in (NSArray *)cells) {
+    if (![cell isKindOfClass:NSDictionary.class] || HRNamesSharedPost(HRTypename(cell))) continue;
+    if ((posted = HRPostedTimeIn(cell)) > 0) return posted;
+  }
+  for (id cell in (NSArray *)cells) {
+    if (![cell isKindOfClass:NSDictionary.class] || HRNamesSharedPost(HRTypename(cell))) continue;
+    for (id key in (NSDictionary *)cell) {
+      id inner = ((NSDictionary *)cell)[key];
+      if (![key isKindOfClass:NSString.class] || ![((NSString *)key).lowercaseString hasSuffix:@"cell"] ||
+          HRNamesSharedPost(key) || ![inner isKindOfClass:NSDictionary.class] || HRNamesSharedPost(HRTypename(inner)))
+        continue;
+      if ((posted = HRPostedTimeIn(inner)) > 0) return posted;
+    }
+  }
+  return 0;
+}
+
+// Whether a request asks for the top or most controversial posts: a "sort" of TOP
+// or CONTROVERSIAL among its variables, or one level in.
+static BOOL HRSortedByTop(id variables, NSUInteger depth) {
+  if (![variables isKindOfClass:NSDictionary.class] || depth > 1) return NO;
+  NSDictionary *dict = variables;
+  for (id key in dict) {
+    id value = dict[key];
+    if ([key isKindOfClass:NSString.class] && [value isKindOfClass:NSString.class] &&
+        [((NSString *)key).lowercaseString containsString:@"sort"]) {
+      NSString *sort = ((NSString *)value).lowercaseString;
+      if ([sort hasPrefix:@"top"] || [sort containsString:@"controversial"]) return YES;
+    }
+    if (HRSortedByTop(value, depth + 1)) return YES;
+  }
+  return NO;
+}
+
+// "Hide Posts Older Than": feed posts from before the time returned are left out.
+// 0 when it's off, or for a feed sorted by Top or Controversial, where old posts are
+// what you asked for.
+static NSTimeInterval HRPostedCutoff(NSDictionary *variables) {
+  NSInteger days = [NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays];
+  if (days <= 0 || HRSortedByTop(variables, 0)) return 0;
+  return NSDate.date.timeIntervalSince1970 - (NSTimeInterval)days * 86400;
+}
+
+// A feed item's type and keys, and its cells' (diagnostics).
+static NSString *HRDescribeKeys(NSDictionary *node) {
+  NSMutableArray<NSString *> *parts = [NSMutableArray array];
+  NSMutableArray<NSDictionary *> *dicts = [NSMutableArray arrayWithObject:node];
+  id cells = node[@"cells"];
+  if ([cells isKindOfClass:NSArray.class])
+    for (id cell in (NSArray *)cells)
+      if ([cell isKindOfClass:NSDictionary.class] && dicts.count < 9) [dicts addObject:cell];
+  for (NSDictionary *dict in dicts) {
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+    for (id key in dict)
+      if ([key isKindOfClass:NSString.class] && ![key isEqualToString:@"cells"]) [keys addObject:key];
+    [keys sortUsingSelector:@selector(compare:)];
+    NSString *type = HRTypename(dict);
+    [parts addObject:[NSString stringWithFormat:@"%@ {%@}", type.length ? type : @"untyped",
+                                                [keys componentsJoinedByString:@", "]]];
+  }
+  return [parts componentsJoinedByString:@"; "];
+}
+
+// "Hide Posts Older Than": whether a feed post is older than that. It's only left
+// out, not counted as read.
+static BOOL HRIsOldPost(NSDictionary *node, NSString *postID, HideReadFeedStats *stats) {
+  NSTimeInterval posted = HRPostedTime(node);
+  if (posted <= 0) {
+    if (stats.diagnostics)
+      HRLogOnce(@"old:unknown", @"[old] couldn't tell when %@ was posted: %@", HRDescribePost(postID),
+                HRDescribeKeys(node));
+    return NO;
+  }
+  if (posted >= stats.postedBefore) return NO;
+  stats.old++;
+  return YES;
+}
+
 // Takes the read posts out of a feed list, and the posts Reddit marks as hidden
 // on your account: the app would show each of those as a "Post hidden / Undo"
 // row. Your own posts stay; one of yours Jax Reddit Eclipse hid before (it's
@@ -372,7 +538,8 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
     visiblePosts++;
     if (stats.rememberTitles) HRRememberTitle(postID, node);
     if (own) continue;
-    if ([store containsPostID:postID] || (crossposts && HRSharesReadPost(node, postID, stats)))
+    if ([store containsPostID:postID] || (crossposts && HRSharesReadPost(node, postID, stats)) ||
+        (stats.postedBefore > 0 && HRIsOldPost(node, postID, stats)))
       [readEdges addObject:@(i)];
   }
 
@@ -1079,6 +1246,7 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
     HideReadFeedStats *stats = [HideReadFeedStats new];
     stats.diagnostics = HRPref(HRPrefDiagnostics);
     stats.rememberTitles = stats.diagnostics || HRPref(HRPrefMarkOpened) || HRPref(HRPrefMarkScrolledPast);
+    stats.postedBefore = HRPostedCutoff(variables);
     HRHideReadPosts(payload, stats);
     atomic_fetch_add(&gFeedPostsSeen, stats.posts);
     if (stats.listedPosts.count) {
@@ -1099,11 +1267,15 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
                   @"[feed] %@ still marks %lu posts hidden by Jax Reddit Eclipse as hidden", name, (unsigned long)left);
     }
     if (stats.posts > 0 || stats.alreadyHidden > 0)
-      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@%@", name, (unsigned long)stats.hidden,
+      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@%@%@", name, (unsigned long)stats.hidden,
             (unsigned long)stats.posts,
             stats.crossposts ? [NSString stringWithFormat:@" (%lu crossposts of posts you've read)",
                                                           (unsigned long)stats.crossposts]
                              : @"",
+            stats.old ? [NSString stringWithFormat:@" (%lu older than %ld days)", (unsigned long)stats.old,
+                                                   (long)[NSUserDefaults.standardUserDefaults
+                                                       integerForKey:HRPrefHideOlderThanDays]]
+                      : @"",
             stats.alreadyHidden ? [NSString stringWithFormat:@", and took out %lu Reddit marks as hidden",
                                                              (unsigned long)stats.alreadyHidden]
                                 : @"",

@@ -33,7 +33,7 @@ Before publishing, change the `Maintainer` and `Author` fields in `control`.
 
 ## Install
 
-- **Download the release:** take the `.deb` from [github.com/alienjax/Reddit-Eclipse/releases/tag/v0.0.30b](https://github.com/alienjax/Reddit-Eclipse/releases/tag/v0.0.30b): the file ending in `_iphoneos-arm64.deb` for rootless jailbreaks (Dopamine, palera1n rootless), or `_iphoneos-arm.deb` for rootful ones (unc0ver, checkra1n, palera1n rootful). Download it on the phone, open it in Filza (tap Share on the downloaded file, then Filza), and tap Install. Then quit Reddit from the app switcher and reopen it.
+- **Download the release:** take the `.deb` from [github.com/alienjax/Reddit-Eclipse/releases/tag/v0.0.31b](https://github.com/alienjax/Reddit-Eclipse/releases/tag/v0.0.31b): the file ending in `_iphoneos-arm64.deb` for rootless jailbreaks (Dopamine, palera1n rootless), or `_iphoneos-arm.deb` for rootful ones (unc0ver, checkra1n, palera1n rootful). Download it on the phone, open it in Filza (tap Share on the downloaded file, then Filza), and tap Install. Then quit Reddit from the app switcher and reopen it.
 - **From the phone:** copy the `.deb` over (AirDrop, then Save to Files), open it with Sileo, Zebra or Filza, and tap Install. Then quit Reddit from the app switcher and reopen it.
 - **Over SSH:** with OpenSSH installed on the phone and both devices on the same Wi-Fi, run `make do THEOS_DEVICE_IP=<phone's IP>`. That builds, installs and relaunches Reddit in one step.
 

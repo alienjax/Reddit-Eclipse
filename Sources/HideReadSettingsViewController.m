@@ -17,11 +17,81 @@ typedef NS_ENUM(NSInteger, HRRowKind) {
   HRRowKindHideAllRead,    // Hide All Read Posts Now (or Stop, while it runs)
   HRRowKindSession,        // this session: posts seen in feeds, counted as read
   HRRowKindLink,           // opens its "url" outside Reddit
+  HRRowKindOlderThan,      // Hide Posts Older Than: opens the list of ages
 };
 
 static NSString *HRFormatted(NSUInteger count) {
   return [NSNumberFormatter localizedStringFromNumber:@(count) numberStyle:NSNumberFormatterDecimalStyle];
 }
+
+#pragma mark - Hide Posts Older Than
+
+// The ages to choose from, in days (0: off).
+static NSArray<NSNumber *> *HROlderThanChoices(void) {
+  return @[ @0, @1, @2, @3, @5, @7, @14, @30, @90, @180, @365 ];
+}
+
+static NSString *HROlderThanTitle(NSInteger days) {
+  switch (days) {
+    case 0: return @"Off";
+    case 1: return @"1 Day";
+    case 7: return @"1 Week";
+    case 14: return @"2 Weeks";
+    case 30: return @"1 Month";
+    case 90: return @"3 Months";
+    case 180: return @"6 Months";
+    case 365: return @"1 Year";
+    default: return [NSString stringWithFormat:@"%ld Days", (long)days];
+  }
+}
+
+static NSString *const HROlderThanFooter =
+    @"Posts older than this are left out wherever read posts are, read or not. They aren’t counted as read "
+    @"or hidden on your account, and feeds sorted by Top or Controversial still show them.";
+
+// The list of ages, with a checkmark on the one chosen, like Settings' own lists.
+@interface HideReadOlderThanViewController : UITableViewController
+@end
+
+@implementation HideReadOlderThanViewController
+
+- (instancetype)init {
+  if ((self = [super initWithStyle:UITableViewStyleInsetGrouped])) self.title = @"Hide Posts Older Than";
+  return self;
+}
+
+- (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
+  return (NSInteger)HROlderThanChoices().count;
+}
+
+- (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
+  return HROlderThanFooter;
+}
+
+- (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
+  UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:nil];
+  NSInteger days = HROlderThanChoices()[(NSUInteger)indexPath.row].integerValue;
+  UIListContentConfiguration *content = [UIListContentConfiguration cellConfiguration];
+  content.text = HROlderThanTitle(days);
+  cell.contentConfiguration = content;
+  BOOL chosen = days == [NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays];
+  cell.accessoryType = chosen ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+  return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath {
+  [tableView deselectRowAtIndexPath:indexPath animated:YES];
+  NSInteger days = HROlderThanChoices()[(NSUInteger)indexPath.row].integerValue;
+  [NSUserDefaults.standardUserDefaults setInteger:days forKey:HRPrefHideOlderThanDays];
+  HRLog(@"[old] Hide Posts Older Than: %@", HROlderThanTitle(days));
+  for (UITableViewCell *cell in tableView.visibleCells) {
+    NSIndexPath *path = [tableView indexPathForCell:cell];
+    BOOL chosen = path && path.row == indexPath.row;
+    cell.accessoryType = chosen ? UITableViewCellAccessoryCheckmark : UITableViewCellAccessoryNone;
+  }
+}
+
+@end
 
 #pragma mark - Window helpers
 
@@ -187,6 +257,11 @@ static NSArray<NSDictionary *> *HRSettingsSections(void) {
                   @"Screen” counts a post visible for a few seconds, using Reddit’s own comment "
                   @"preloading. “It’s a Crosspost of a Read Post” leaves out a crosspost when you’ve "
                   @"read the post it shares.",
+    },
+    @{
+      @"header" : @"Old Posts",
+      @"rows" : @[ @{@"title" : @"Hide Posts Older Than", @"kind" : @(HRRowKindOlderThan)} ],
+      @"footer" : HROlderThanFooter,
     },
     @{
       @"header" : @"Also Hide Read Posts In",
@@ -438,6 +513,13 @@ static UIImage *HRFadeMask(CGFloat height, CGFloat fade) {
       cell.selectionStyle = UITableViewCellSelectionStyleNone;
       break;
     }
+    case HRRowKindOlderThan:
+      content = [UIListContentConfiguration valueCellConfiguration];
+      content.text = row[@"title"];
+      content.secondaryText =
+          HROlderThanTitle([NSUserDefaults.standardUserDefaults integerForKey:HRPrefHideOlderThanDays]);
+      cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+      break;
     case HRRowKindLink:
       content.textProperties.color = self.view.tintColor ?: UIColor.systemBlueColor;
       cell.accessibilityTraits |= UIAccessibilityTraitLink;
@@ -456,6 +538,9 @@ static UIImage *HRFadeMask(CGFloat height, CGFloat fade) {
       break;
     case HRRowKindViewLog:
       [self.navigationController pushViewController:[HideReadLogViewController new] animated:YES];
+      break;
+    case HRRowKindOlderThan:
+      [self.navigationController pushViewController:[HideReadOlderThanViewController new] animated:YES];
       break;
     case HRRowKindHideAllRead:
       if ([HRAccountHiderStatus()[@"bulkTotal"] unsignedIntegerValue])

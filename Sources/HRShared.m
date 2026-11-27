@@ -7,6 +7,7 @@ NSString *const HRPrefMarkOpened = @"HRMarkOpened";
 NSString *const HRPrefMarkLingered = @"HRMarkLingered";
 NSString *const HRPrefMarkScrolledPast = @"HRMarkScrolledPast";
 NSString *const HRPrefMarkCrossposts = @"HRMarkCrossposts";
+NSString *const HRPrefHideOlderThanDays = @"HRHideOlderThanDays";
 NSString *const HRPrefHideButton = @"HRHideButton";
 NSString *const HRPrefHideOnAccount = @"HRHideOnAccount";
 NSString *const HRPrefHiddenNote = @"HRHiddenNote";
@@ -17,7 +18,7 @@ NSString *const HRPrefDiagnostics = @"HRDiagnostics";
 NSString *const HRPrefHintShown = @"HRHintShown2";
 NSString *const HRPrefReadHintShown = @"HRReadHintShown";
 
-NSString *const HRTweakVersion = @"0.0.30b";
+NSString *const HRTweakVersion = @"0.0.31b";
 
 static const NSUInteger kHRMaxLogLines = 400;
 
@@ -32,6 +33,7 @@ void HRRegisterDefaults(void) {
     HRPrefMarkLingered : @NO,
     HRPrefMarkScrolledPast : @YES,
     HRPrefMarkCrossposts : @YES,
+    HRPrefHideOlderThanDays : @0,
     HRPrefHideButton : @YES,
     HRPrefHiddenNote : @YES,
     HRPrefHideOnAccount : @YES,
