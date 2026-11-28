@@ -132,6 +132,14 @@ NSArray<NSString *> *HRAddOwnPosts(NSArray<NSString *> *postIDs) {
   return added;
 }
 
+BOOL HRKnowsOwnAccount(void) {
+  os_unfair_lock_lock(&gLock);
+  HRLoad();
+  BOOL known = gAccounts.count > 0;
+  os_unfair_lock_unlock(&gLock);
+  return known;
+}
+
 void HRAddOwnAccount(NSString *name, NSString *accountID) {
   NSString *lowered = name.lowercaseString;
   if (!lowered.length) return;

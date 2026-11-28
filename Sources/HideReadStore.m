@@ -82,6 +82,14 @@ static const int64_t kHRSaveDelay = 2 * NSEC_PER_SEC;
   return found;
 }
 
+- (NSTimeInterval)readTimeForPostID:(NSString *)postID {
+  if (postID.length == 0) return 0;
+  os_unfair_lock_lock(&_lock);
+  NSTimeInterval time = [_entries[postID] doubleValue];
+  os_unfair_lock_unlock(&_lock);
+  return time;
+}
+
 - (BOOL)markPostID:(NSString *)postID {
   if (postID.length == 0 || HRIsOwnPost(postID)) return NO;  // your own posts never count as read
   NSNumber *now = @(NSDate.date.timeIntervalSince1970);

@@ -121,25 +121,40 @@ static void HRNoteUnwatchedRequest(NSURLRequest *request, BOOL hasCompletionHand
             apiHost ? @" (request has no completion handler)" : @"");
 }
 
+// The operation, or for a request that names none (Reddit's REST API), its path.
+static NSString *HRRequestName(NSURLRequest *request, NSData *body) {
+  return HROperationName(request, body) ?: request.URL.path;
+}
+
 // The handler to pass on: wrapped for responses Jax Reddit Eclipse needs, the app's own
 // for everything else.
 static HRCompletionHandler HRHandlerFor(NSURLSession *session, NSURLRequest *request, NSData *body,
                                         HRCompletionHandler completionHandler) {
+  // Jax Reddit Eclipse's own requests to Reddit (hiding posts on your account): untouched.
+  if (HRAccountHiderIsOwnRequest(request)) return completionHandler;
   HRAccountHiderNoteRequest(session, request);  // the app's sign-in, for hiding posts on your account
   // Jax Reddit Eclipse's own requests for a next page: the handler waiting for them reads them.
   if (completionHandler && HRIsTopUpRequest(request)) return completionHandler;
+  // The app hiding a post (⋯ → Hide post): how to hide posts the app's own way.
+  completionHandler = HRAccountHiderWatchRequest(request, body, completionHandler);
+  BOOL diagnostics = HRPref(HRPrefDiagnostics);
   if (!completionHandler || !HRShouldProcessRequest(request)) {
     HRNoteUnwatchedRequest(request, completionHandler != nil);
+    if (diagnostics && HRShouldProcessRequest(request))
+      HRNoteAPIRequest(HRRequestName(request, body), @"no completion handler");
     return completionHandler;
   }
   NSString *operation = HROperationName(request, body);
   if (!HRShouldWatchOperation(operation)) {
-    if (HRPref(HRPrefDiagnostics))
+    if (diagnostics) {
       HRLogOnce([@"passed:" stringByAppendingString:operation ?: @"?"],
                 @"[api] %@ (%@, passed through)", operation ?: @"unnamed operation",
                 request.URL.host);
+      HRNoteAPIRequest(operation ?: request.URL.path, @"passed through");
+    }
     return completionHandler;
   }
+  if (diagnostics) HRNoteAPIRequest(operation, nil);
   return HRWrapCompletionHandler(session, request, body, completionHandler);
 }
 
@@ -216,13 +231,15 @@ static volatile BOOL gOuterHooksInstalled;
 %hook NSURLSession
 
 - (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request {
-  if (!gCreatingHandlerTask) {
+  if (!gCreatingHandlerTask && !HRAccountHiderIsOwnRequest(request)) {
     HRAccountHiderNoteRequest(self, request);
+    HRAccountHiderWatchRequest(request, request.HTTPBody, nil);
     if (HRPref(HRPrefDiagnostics) && HRShouldProcessRequest(request)) {
       NSString *operation = HROperationName(request, request.HTTPBody) ?: @"unnamed operation";
       HRLogOnce([@"streamed:" stringByAppendingString:operation],
                 @"[api] %@ (%@) is streamed: Jax Reddit Eclipse can't read or filter it", operation,
                 request.URL.host);
+      HRNoteAPIRequest(HRRequestName(request, request.HTTPBody), @"streamed");
     }
   }
   return %orig;

@@ -320,6 +320,75 @@ static void HRForgetPositions(void) {
   [gCellCache removeAllObjects];
 }
 
+// Diagnostics: a post card Jax Reddit Eclipse never saw in any answer, or a read
+// post's card that isn't in the list Jax Reddit Eclipse handed the app with the
+// cards around it. Either way Reddit put it there by itself (below a post you
+// opened, say), so the log names the app's requests in the 90 seconds before it
+// showed up, to find the one that brought it. Once per card, and at most 12 of
+// each kind per run.
+static NSMutableDictionary<NSString *, NSNumber *> *gStrangerSince;  // card label or post id -> first on screen
+static NSMutableSet<NSString *> *gStrangersTold;
+static NSUInteger gUnknownCardsTold;
+static NSUInteger gReadCardsTold;
+
+static void HRNoteStrangers(UIScrollView *list, CGFloat top, CGFloat bottom) {
+  if (!gStrangerSince) {
+    gStrangerSince = [NSMutableDictionary dictionary];
+    gStrangersTold = [NSMutableSet set];
+  }
+  if (gStrangerSince.count > 500) [gStrangerSince removeAllObjects];
+  CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+  NSMutableArray<NSString *> *matched = [NSMutableArray array];
+  NSMutableArray<UIView *> *unmatched = [NSMutableArray array];
+  for (UIView *cell in HRVisibleCells(list)) {
+    if (cell.hidden || cell.bounds.size.height < 40) continue;
+    if (CGRectGetMaxY(cell.frame) <= top || CGRectGetMinY(cell.frame) >= bottom) continue;
+    NSString *postID = HRPostIDForCell(cell);
+    if (postID)
+      [matched addObject:postID];
+    else
+      [unmatched addObject:cell];
+  }
+
+  for (UIView *cell in unmatched) {
+    NSString *label = HRFirstLabel(cell);
+    if (label.length < 12 || ![label hasPrefix:@"r/"]) continue;  // a post card's label starts with its subreddit
+    NSString *key = [@"label:" stringByAppendingString:label];
+    if ([gStrangersTold containsObject:key]) continue;
+    NSNumber *since = gStrangerSince[key];
+    if (!since) {
+      gStrangerSince[key] = @(now);
+      continue;
+    }
+    if (now - since.doubleValue < 1.5) continue;  // it may still be filling in
+    [gStrangersTold addObject:key];
+    if (gUnknownCardsTold++ >= 12) continue;
+    HRLog(@"[scroll] a post card Jax Reddit Eclipse never saw in an answer: “%@” (the app's requests in the 90 "
+          @"seconds before it showed up: %@)",
+          HRShortened(label), HRRecentAPIRequests(since.doubleValue - 90));
+  }
+
+  if (matched.count < 2) return;  // nothing around it to tell by
+  HideReadStore *store = HideReadStore.sharedStore;
+  for (NSString *postID in matched) {
+    NSString *key = [@"post:" stringByAppendingString:postID];
+    if ([gStrangersTold containsObject:key]) continue;
+    NSTimeInterval readAt = [store readTimeForPostID:postID];
+    if (readAt <= 0) continue;
+    NSNumber *since = gStrangerSince[key];
+    if (!since) gStrangerSince[key] = since = @(now);
+    if (HRIsListedWith(postID, matched)) continue;
+    [gStrangersTold addObject:key];
+    if (gReadCardsTold++ >= 12) continue;
+    NSDateFormatter *formatter = [NSDateFormatter new];
+    formatter.dateFormat = @"HH:mm:ss";
+    HRLog(@"[scroll] %@, read at %@, is on screen, but Jax Reddit Eclipse didn't hand it to the app in this "
+          @"list: Reddit added it by itself (the app's requests in the 90 seconds before it showed up: %@)",
+          HRDescribePost(postID), [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:readAt]],
+          HRRecentAPIRequests(since.doubleValue - 90));
+  }
+}
+
 static void HRWatchList(UIScrollView *list) {
   CGFloat offset = list.contentOffset.y;
   CGFloat height = list.bounds.size.height;
@@ -384,6 +453,8 @@ static void HRWatchList(UIScrollView *list) {
     [onScreen removeObject:topmost];
     for (NSString *postID in HRTakePostsListedBefore(topmost, onScreen)) HRMarkScrolledPast(postID, YES);
   }
+
+  if (HRPref(HRPrefDiagnostics)) HRNoteStrangers(list, top, bottom);
 
   // Diagnostics: a summary every 1,500 points of scrolling (or 5 seconds of it).
   CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();

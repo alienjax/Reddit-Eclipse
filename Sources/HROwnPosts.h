@@ -27,8 +27,11 @@ BOOL HRCheckOwnPost(NSString *postID, NSDictionary *node);
 /// Returns those that weren't known yet.
 NSArray<NSString *> *HRAddOwnPosts(NSArray<NSString *> *postIDs);
 
-/// An account the app is signed in to (from Reddit's /api/v1/me): its name and
-/// "t2_" id.
+/// An account the app is signed in to (from Reddit's /api/v1/me, or the
+/// account an answer says is signed in): its name and "t2_" id.
 void HRAddOwnAccount(NSString *name, NSString *_Nullable accountID);
+
+/// YES once any account of yours is known, so your posts can be told apart.
+BOOL HRKnowsOwnAccount(void);
 
 NS_ASSUME_NONNULL_END

@@ -7,8 +7,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// every post in the read history at once. See HRAccountHider.m.
 
 /// Call for each request the Reddit app makes: picks up the app's own sign-in
-/// (its Authorization header) for hiding posts. Any thread; cheap.
+/// (its Authorization header) for hiding posts, and the session and headers its
+/// requests go out with, which Jax Reddit Eclipse's own requests to Reddit use
+/// too. Any thread; cheap.
 void HRAccountHiderNoteRequest(NSURLSession *session, NSURLRequest *request);
+
+/// YES for Jax Reddit Eclipse's own requests to Reddit (hiding posts on your
+/// account, and the lookups that go with it), which go through the app's own
+/// session: the network hooks pass them through untouched. Any thread; cheap.
+BOOL HRAccountHiderIsOwnRequest(NSURLRequest *request);
+
+typedef void (^HRAccountCompletionHandler)(NSData *_Nullable data, NSURLResponse *_Nullable response,
+                                           NSError *_Nullable error);
+
+/// Call for each GraphQL request the Reddit app makes, with its body and its
+/// completion handler (nil for a request without one). When it's the app hiding
+/// a post (⋯ → Hide post), Jax Reddit Eclipse learns from it how to hide posts
+/// the app's own way, for while Reddit's API won't take the app's sign-in.
+/// Returns the handler to pass on: `handler` itself, or one that reads Reddit's
+/// answer first. Any thread.
+HRAccountCompletionHandler _Nullable HRAccountHiderWatchRequest(NSURLRequest *request, NSData *_Nullable body,
+                                                                HRAccountCompletionHandler _Nullable handler);
 
 /// A post newly counted as read: queued to be hidden on your account. Any thread.
 void HRAccountHiderQueue(NSString *postID);

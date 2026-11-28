@@ -46,7 +46,16 @@
 // own requests to reddit.com, picked up as they go out. It's kept in memory
 // only, never written down or logged, and only ever sent back to Reddit. If
 // Reddit turns it down three times in a row, hiding on your account stops until
-// Reddit next becomes active.
+// Reddit next becomes active. Its requests go out like the app's own: through
+// the app's own URL session (its cookies and settings), with the headers of the
+// app's latest request that say who's asking (device, session, app version).
+// A sign-in Reddit's API answers as if no one were logged in (/api/v1/me with
+// no account in it) isn't used to hide posts.
+//
+// When Reddit's API won't take the app's sign-in, posts are hidden the way the
+// app itself hides one: its own GraphQL request for ⋯ → Hide post, learned the
+// first time you hide a post yourself, and sent again with each read post in
+// it, one at a time (see "The app's own way" below).
 //
 // Jax Reddit Eclipse still leaves read posts out of the feeds itself as well:
 // that covers posts still waiting to be sent, and any Reddit wouldn't take. A
@@ -59,6 +68,7 @@ static NSString *const kHRHideURL = @"https://oauth.reddit.com/api/hide";
 static NSString *const kHRInfoURL = @"https://oauth.reddit.com/api/info";
 static NSString *const kHRUnhideURL = @"https://oauth.reddit.com/api/unhide";
 static NSString *const kHRMeURL = @"https://oauth.reddit.com/api/v1/me";
+static NSString *const kHROwnRequestKey = @"HideReadAccountRequest";  // marks Jax Reddit Eclipse's own requests
 static NSString *const kHRCheckedAccountsKey = @"HRAccountHiddenCheckedFor";  // record checked for their posts
 static NSString *const kHRPendingKey = @"HRAccountHidePending";
 static const NSUInteger kHRBatchSize = 25;
@@ -112,6 +122,14 @@ static UIBackgroundTaskIdentifier gQueueBackgroundTask;  // the time that's for 
 
 static NSMutableDictionary<NSString *, NSString *> *gAccountForSignIn;  // sign-in -> your account (memory only)
 static NSMutableArray<NSString *> *gRefusedSignIns;  // sign-ins Reddit turned down, not used again (memory only)
+static NSMutableArray<NSString *> *gAnonymousSignIns;  // sign-ins Reddit's API answers as logged out (memory only)
+static NSMutableOrderedSet<NSString *> *gRecentSignIns;  // the app's latest few, most recent last (memory only)
+static NSMutableOrderedSet<NSString *> *gRecentGraphQLSignIns;  // the same, on its GraphQL requests
+static NSURLSession *gAppSession;      // the session of the app's latest API request: Jax Reddit Eclipse's go through it
+static NSURLSession *gAppGraphQLSession;  // the same, for GraphQL
+static NSDictionary<NSString *, NSString *> *gAppHeaders;  // that request's headers that say who's asking (memory only)
+static NSArray<NSString *> *gAppHeaderNames;  // for the log
+static BOOL gOwnSessionOnly;  // the app's session wouldn't carry Jax Reddit Eclipse's requests: its own from then on
 static NSString *gListedAccount;          // the account whose newest posts were listed last
 static CFAbsoluteTime gOwnListedAt;       // when
 static NSMutableOrderedSet<NSString *> *gUnhide;   // your posts hidden here before: unhidden
@@ -126,7 +144,23 @@ static NSSet<NSString *> *gHid;
 // Main thread only: the background time iOS gave, if any (set up as UIBackgroundTaskInvalid).
 static UIBackgroundTaskIdentifier gBackgroundTask;
 
+// The app's own way of hiding a post (see "The app's own way").
+static NSString *const kHRAppHideRequestKey = @"HRAppHideRequest";  // in the user defaults
+static NSString *const kHRPostPlaceholder = @"__JaxRedditEclipsePost__";
+static const NSTimeInterval kHRAppWayGap = 3;       // between posts hidden that way
+static NSDictionary *gAppHideRequest;               // url, body, headers, operation, confirmed
+static NSUInteger gAppWayFailures;                  // in a row
+static NSUInteger gAppWayLogged;                    // posts hidden that way since the last line in the log about it
+static NSMutableOrderedSet<NSString *> *gChecked;   // checked as not yours, waiting to be hidden that way
+static BOOL gToldUncheckedAuthors;                  // the log said who posted them couldn't be looked up
+static BOOL gToldAppWay;                            // the log named the first post hidden that way
+
 static void HRSendBatch(void);
+static BOOL HRCanHideTheAppsWay(void);
+static NSMutableURLRequest *HRGetRequest(NSString *url, NSDictionary<NSString *, NSString *> *query,
+                                         NSString *authorization);
+static NSURLSessionDataTask *HRTaskFor(NSMutableURLRequest *request, BOOL graphQL,
+                                       void (^handler)(NSData *data, NSURLResponse *response, NSError *error));
 
 static BOOL HRAccountHidingOn(void) {
   return HRPref(HRPrefEnabled) && HRPref(HRPrefHideOnAccount);
@@ -200,7 +234,8 @@ static void HREndBackgroundTask(UIBackgroundTaskIdentifier task) {
 static void HREndBackgroundTimeIfDone(void) {
   if (!gBackgroundTime || gSending || gLookUps) return;
   BOOL waiting = gPending.count > 0 || gBulk.count > 0;
-  if (waiting && !gStopped && gAuthorization && gNextAllowed - CFAbsoluteTimeGetCurrent() < 20) return;
+  BOOL canSend = (gAuthorization && !gStopped) || HRCanHideTheAppsWay();
+  if (waiting && canSend && gNextAllowed - CFAbsoluteTimeGetCurrent() < 20) return;
   UIBackgroundTaskIdentifier task = gQueueBackgroundTask;
   gBackgroundTime = NO;
   gQueueBackgroundTask = UIBackgroundTaskInvalid;
@@ -286,6 +321,19 @@ static void HRSaveRecordSoon(void) {
   });
 }
 
+// The app's own hide request, as learned (see "The app's own way"), from the
+// user defaults: only one with everything in place.
+static void HRLoadAppHideRequest(void) {
+  id saved = [NSUserDefaults.standardUserDefaults dictionaryForKey:kHRAppHideRequestKey];
+  if (![saved isKindOfClass:NSDictionary.class]) return;
+  NSDictionary *request = saved;
+  if (![request[@"url"] isKindOfClass:NSString.class] || ![request[@"body"] isKindOfClass:NSString.class] ||
+      ![(NSString *)request[@"body"] containsString:kHRPostPlaceholder] ||
+      ![request[@"headers"] isKindOfClass:NSDictionary.class])
+    return;
+  gAppHideRequest = request;
+}
+
 #pragma mark - Sending
 
 static void HRSetUp(void) {
@@ -301,13 +349,18 @@ static void HRSetUp(void) {
     gBulk = [NSMutableOrderedSet orderedSet];
     gAccountForSignIn = [NSMutableDictionary dictionary];
     gRefusedSignIns = [NSMutableArray array];
+    gAnonymousSignIns = [NSMutableArray array];
+    gRecentSignIns = [NSMutableOrderedSet orderedSet];
+    gRecentGraphQLSignIns = [NSMutableOrderedSet orderedSet];
     gUnhide = [NSMutableOrderedSet orderedSet];
     gToCheck = [NSMutableOrderedSet orderedSet];
+    gChecked = [NSMutableOrderedSet orderedSet];
     gRecord = [NSMutableDictionary dictionary];
     // Off the calling thread, and before anything else runs on the queue.
     dispatch_async(gQueue, ^{
       HRLoadRecord();
       HRMirrorRecord();
+      HRLoadAppHideRequest();
       for (id postID in [NSUserDefaults.standardUserDefaults arrayForKey:kHRPendingKey])
         if ([postID isKindOfClass:NSString.class] && [(NSString *)postID hasPrefix:@"t3_"] && !gRecord[postID])
           [gPending addObject:postID];
@@ -357,7 +410,7 @@ static BOOL HRNeedsOwnList(void) {
 // (needed to tell your posts apart); and while Reddit is open, your posts to
 // unhide, your newest posts to list, the record to check for yours.
 static BOOL HRHousekeepingDue(void) {
-  if (!gAuthorization) return NO;
+  if (!gAuthorization || gStopped) return NO;
   if (HRNeedsAccount()) return gPending.count > 0 || HRBulkCanSend() || HRCanTidyUp();
   return HRCanTidyUp() && (gUnhide.count > 0 || gToCheck.count > 0 || HRNeedsOwnList());
 }
@@ -365,10 +418,12 @@ static BOOL HRHousekeepingDue(void) {
 // Sends now if a batch is full (or as soon as the pause allows), there's a
 // lookup to do, or Reddit is leaving the screen, otherwise in up to 10 seconds.
 static void HRConsiderSending(void) {
-  if (gSending || gStopped) return;
+  if (gSending) return;
+  BOOL appsWay = (!gAuthorization || gStopped) && HRCanHideTheAppsWay();
+  if (gStopped && !appsWay) return;
   BOOL housekeeping = HRHousekeepingDue();
   if (!housekeeping && !gPending.count && !HRBulkCanSend()) return;
-  if (!gAuthorization) {
+  if (!gAuthorization && !appsWay) {
     if (!gToldWaiting) {
       gToldWaiting = YES;
       HRLog(@"[account] %lu posts waiting for the Reddit app's sign-in to hide them on your account",
@@ -377,8 +432,11 @@ static void HRConsiderSending(void) {
     return;
   }
   NSTimeInterval wait = MAX(0, gNextAllowed - CFAbsoluteTimeGetCurrent());
-  if (housekeeping || HRBulkCanSend() || gPending.count >= kHRBatchSize || !gAppActive) HRArmSend(wait);
-  else if (!gTimerArmed) HRArmSend(MAX(wait, kHRGatherDelay));
+  if (housekeeping || HRBulkCanSend() || gPending.count >= kHRBatchSize || !gAppActive ||
+      (appsWay && gChecked.count))
+    HRArmSend(wait);
+  else if (!gTimerArmed)
+    HRArmSend(MAX(wait, kHRGatherDelay));
 }
 
 static NSString *HRFormEncode(NSString *value) {
@@ -437,16 +495,9 @@ static void HRLookUpHidden(NSString *postID, NSString *authorization, NSTimeInte
                            void (^done)(NSNumber *hidden, NSString *title)) {
   gLookUps++;
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), gQueue, ^{
-    NSURLComponents *components = [NSURLComponents componentsWithString:kHRInfoURL];
-    components.queryItems = @[
-      [NSURLQueryItem queryItemWithName:@"id" value:postID], [NSURLQueryItem queryItemWithName:@"raw_json" value:@"1"]
-    ];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:components.URL];
-    [request setValue:authorization forHTTPHeaderField:@"Authorization"];
-    if (gUserAgent) [request setValue:gUserAgent forHTTPHeaderField:@"User-Agent"];
-    NSURLSessionDataTask *task = [gSession
-        dataTaskWithRequest:request
-          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSMutableURLRequest *request = HRGetRequest(kHRInfoURL, @{@"id" : postID, @"raw_json" : @"1"}, authorization);
+    NSURLSessionDataTask *task = HRTaskFor(
+        request, NO, ^(NSData *data, NSURLResponse *response, NSError *error) {
             NSInteger status = HRStatusCode(response);
             NSDictionary *post = !error && status >= 200 && status < 300 ? HRPostInfo(data, postID) : nil;
             id flag = post[@"hidden"];
@@ -475,7 +526,7 @@ static void HRLookUpHidden(NSString *postID, NSString *authorization, NSTimeInte
               HRStatusChanged();
               HREndBackgroundTimeIfDone();
             });
-          }];
+          });
     [task resume];
   });
 }
@@ -605,6 +656,35 @@ static void HRHandleFailure(NSArray<NSString *> *batch, NSURLResponse *response,
   }
 }
 
+// Reddit's API answered your account's lookup (/api/v1/me) for this sign-in as
+// if no one were logged in: it can't hide posts on your account, so it isn't
+// used again (until "Hide All Read Posts Now"), and isn't tried every minute.
+// Posts are hidden the app's own way instead, once that's been learned.
+static void HRNoteLoggedOutSignIn(NSString *authorization, NSURLResponse *response) {
+  if (authorization.length && ![gAnonymousSignIns containsObject:authorization]) {
+    [gAnonymousSignIns addObject:authorization];
+    if (gAnonymousSignIns.count > 8) [gAnonymousSignIns removeObjectAtIndex:0];
+  }
+  if ([gAuthorization isEqualToString:authorization]) gAuthorization = nil;
+  gToldWaiting = NO;
+  gProblem = @"Reddit’s API answers the Reddit app’s sign-in as if no one were logged in.";
+  NSString *headers = HRPref(HRPrefDiagnostics) && gAppHeaderNames.count
+                          ? [NSString stringWithFormat:@"; sent with the app's headers %@",
+                                                       [gAppHeaderNames componentsJoinedByString:@", "]]
+                          : @"";
+  HRLog(@"[account] Reddit's API answers sign-in %@ as if no one were logged in (HTTP %ld from %@ with no account "
+        @"in it%@), so it isn't used to hide posts; %@",
+        HRSignInTag(authorization), (long)HRStatusCode(response), response.URL.path ?: @"?", headers,
+        HRCanHideTheAppsWay() ? @"they're hidden the Reddit app's own way instead"
+        : gAppHideRequest     ? @"they'll be hidden the Reddit app's own way once your account is known"
+                              : @"to hide them anyway, hide one post yourself (⋯ → Hide post), and the rest are "
+                                @"hidden the same way");
+  if (!HRCanHideTheAppsWay())
+    HRTellProblem(@"Couldn’t hide your read posts: Reddit’s API answers the Reddit app’s sign-in as if no one were "
+                  @"logged in. Hide one post yourself (⋯ → Hide post), and Jax Reddit Eclipse will hide the rest the "
+                  @"same way.");
+}
+
 static void HRHandleAnswer(NSArray<NSString *> *batch, NSURLResponse *response, NSError *error, NSData *data,
                            NSString *authorization) {
   NSInteger status = HRStatusCode(response);
@@ -636,6 +716,94 @@ static void HRHandleAnswer(NSArray<NSString *> *batch, NSURLResponse *response, 
   if (bulkRunning && !gBulk.count) HRFinishBulk();
 }
 
+// The headers of the app's requests that Jax Reddit Eclipse's own carry too: those
+// that say who's asking (device, session, app version, language). Not those
+// about the request itself (its body, its GraphQL operation, a signature,
+// tracing), cookies (the session adds its own), or the sign-in (set apart).
+static BOOL HRIsCopiedHeader(NSString *name) {
+  static NSSet<NSString *> *skipped;
+  static dispatch_once_t once;
+  dispatch_once(&once, ^{
+    skipped = [NSSet setWithArray:@[
+      @"authorization", @"content-type", @"content-length", @"content-md5", @"accept", @"host", @"connection",
+      @"cookie", @"expect", @"te", @"transfer-encoding", @"traceparent", @"tracestate"
+    ]];
+  });
+  NSString *lowered = name.lowercaseString;
+  if (!lowered.length || [skipped containsObject:lowered]) return NO;
+  for (NSString *fragment in @[
+         @"apollo", @"operation", @"encoding", @"compression", @"signature", @"signed", @"hmac", @"request-id",
+         @"requestid", @"retry", @"trace", @"span", @"b3"
+       ])
+    if ([lowered containsString:fragment]) return NO;
+  return YES;
+}
+
+// The app's headers that say who's asking, then the sign-in.
+static void HRDressRequest(NSMutableURLRequest *request, NSString *authorization) {
+  for (NSString *name in gAppHeaders) [request setValue:gAppHeaders[name] forHTTPHeaderField:name];
+  if (gUserAgent && ![request valueForHTTPHeaderField:@"User-Agent"])
+    [request setValue:gUserAgent forHTTPHeaderField:@"User-Agent"];
+  [request setValue:authorization forHTTPHeaderField:@"Authorization"];
+}
+
+// A task for one of Jax Reddit Eclipse's own requests to Reddit: marked as its own
+// (the network hooks let it through untouched), and through the app's own
+// session (with `graphQL`, the one for its GraphQL requests), so it goes out
+// with the app's cookies and settings; else through its own session.
+// A request the connection itself refused or cut off (a certificate the app's
+// session won't accept from Jax Reddit Eclipse, say), rather than Reddit's answer.
+static BOOL HRIsConnectionRefusal(NSError *error) {
+  if (![error.domain isEqualToString:@"NSURLErrorDomain"]) return NO;
+  switch (error.code) {
+    case NSURLErrorCancelled:
+    case NSURLErrorUserCancelledAuthentication:
+    case NSURLErrorSecureConnectionFailed:
+    case NSURLErrorServerCertificateHasBadDate:
+    case NSURLErrorServerCertificateUntrusted:
+    case NSURLErrorServerCertificateHasUnknownRoot:
+    case NSURLErrorServerCertificateNotYetValid:
+    case NSURLErrorClientCertificateRejected:
+    case NSURLErrorClientCertificateRequired:
+      return YES;
+    default:
+      return NO;
+  }
+}
+
+static NSURLSessionDataTask *HRTaskFor(NSMutableURLRequest *request, BOOL graphQL,
+                                       void (^handler)(NSData *data, NSURLResponse *response, NSError *error)) {
+  [NSURLProtocol setProperty:@YES forKey:kHROwnRequestKey inRequest:request];
+  request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+  NSURLSession *session = gOwnSessionOnly ? nil
+                          : graphQL       ? (gAppGraphQLSession ?: gAppSession)
+                                          : (gAppSession ?: gAppGraphQLSession);
+  if (session && session != gSession) {
+    // If the app's session won't carry it, Jax Reddit Eclipse's own session from then on.
+    void (^watched)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *response, NSError *error) {
+      if (HRIsConnectionRefusal(error))
+        dispatch_async(gQueue, ^{
+          if (gOwnSessionOnly) return;
+          gOwnSessionOnly = YES;
+          HRLog(@"[account] the Reddit app's session wouldn't carry a request (%@); using Jax Reddit Eclipse's own",
+                error.localizedDescription);
+        });
+      handler(data, response, error);
+    };
+    @try {
+      NSURLSessionDataTask *task = [session dataTaskWithRequest:request completionHandler:watched];
+      if (task) return task;
+    } @catch (NSException *exception) {
+      // The app let that session go: Jax Reddit Eclipse's own until the app's next request.
+      HRLog(@"[account] the Reddit app's session couldn't take a request (%@); using Jax Reddit Eclipse's own",
+            exception.reason);
+      if (gAppSession == session) gAppSession = nil;
+      if (gAppGraphQLSession == session) gAppGraphQLSession = nil;
+    }
+  }
+  return [gSession dataTaskWithRequest:request completionHandler:handler];
+}
+
 // A GET request to Reddit with the app's sign-in.
 static NSMutableURLRequest *HRGetRequest(NSString *url, NSDictionary<NSString *, NSString *> *query,
                                          NSString *authorization) {
@@ -644,8 +812,7 @@ static NSMutableURLRequest *HRGetRequest(NSString *url, NSDictionary<NSString *,
   for (NSString *name in query) [items addObject:[NSURLQueryItem queryItemWithName:name value:query[name]]];
   components.queryItems = items;
   NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:components.URL];
-  [request setValue:authorization forHTTPHeaderField:@"Authorization"];
-  if (gUserAgent) [request setValue:gUserAgent forHTTPHeaderField:@"User-Agent"];
+  HRDressRequest(request, authorization);
   return request;
 }
 
@@ -653,8 +820,7 @@ static NSMutableURLRequest *HRGetRequest(NSString *url, NSDictionary<NSString *,
 static NSMutableURLRequest *HRPostsRequest(NSString *url, NSArray<NSString *> *postIDs, NSString *authorization) {
   NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:url]];
   request.HTTPMethod = @"POST";
-  [request setValue:authorization forHTTPHeaderField:@"Authorization"];
-  if (gUserAgent) [request setValue:gUserAgent forHTTPHeaderField:@"User-Agent"];
+  HRDressRequest(request, authorization);
   [request setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
   NSString *body = [@"id=" stringByAppendingString:HRFormEncode([postIDs componentsJoinedByString:@","])];
   request.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
@@ -690,30 +856,28 @@ static BOOL HRIsLookUpRefused(NSInteger status) {
 // on the queue. The next request waits `gap` seconds from now at least. An
 // answer means the sign-in works and Reddit can be reached: any pause for
 // trouble starts over.
-static void HRSend(NSURLRequest *request, NSTimeInterval gap,
+static void HRSend(NSMutableURLRequest *request, NSTimeInterval gap, BOOL graphQL,
                    void (^done)(NSData *data, NSURLResponse *response, NSError *error)) {
   gSending = YES;
   if (!gAppActive) gBackgroundSends++;
   gNextAllowed = MAX(gNextAllowed, CFAbsoluteTimeGetCurrent() + gap);
-  NSURLSessionDataTask *task =
-      [gSession dataTaskWithRequest:request
-                  completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
-                    dispatch_async(gQueue, ^{
-                      gSending = NO;
-                      NSInteger status = HRStatusCode(response);
-                      if (!error && status >= 200 && status < 300) gBackoff = gRefusals = 0;
-                      HRRespectRateLimit(response);
-                      done(data, response, error);
-                      HRStatusChanged();
-                      HRConsiderSending();
-                      HREndBackgroundTimeIfDone();
-                    });
-                  }];
+  NSURLSessionDataTask *task = HRTaskFor(request, graphQL, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    dispatch_async(gQueue, ^{
+      gSending = NO;
+      NSInteger status = HRStatusCode(response);
+      if (!error && status >= 200 && status < 300) gBackoff = gRefusals = 0;
+      HRRespectRateLimit(response);
+      done(data, response, error);
+      HRStatusChanged();
+      HRConsiderSending();
+      HREndBackgroundTimeIfDone();
+    });
+  });
   [task resume];
 }
 
 static void HRSendHide(NSArray<NSString *> *batch, NSString *authorization) {
-  HRSend(HRPostsRequest(kHRHideURL, batch, authorization), HRBulkCanSend() ? kHRBulkGap : kHRMinGap,
+  HRSend(HRPostsRequest(kHRHideURL, batch, authorization), HRBulkCanSend() ? kHRBulkGap : kHRMinGap, NO,
          ^(NSData *data, NSURLResponse *response, NSError *error) {
            HRHandleAnswer(batch, response, error, data, authorization);
          });
@@ -723,9 +887,9 @@ static void HRSendHide(NSArray<NSString *> *batch, NSString *authorization) {
 // /api/info). Yours are left out, and never hidden; the rest go right after.
 static void HRCheckThenHide(NSArray<NSString *> *batch) {
   NSString *authorization = gAuthorization;
-  NSURLRequest *request =
+  NSMutableURLRequest *request =
       HRGetRequest(kHRInfoURL, @{@"id" : [batch componentsJoinedByString:@","], @"raw_json" : @"1"}, authorization);
-  HRSend(request, kHRLookUpGap, ^(NSData *data, NSURLResponse *response, NSError *error) {
+  HRSend(request, kHRLookUpGap, NO, ^(NSData *data, NSURLResponse *response, NSError *error) {
     NSInteger status = HRStatusCode(response);
     BOOL bulkRunning = gBulkTotal > 0;
     NSDictionary<NSString *, NSDictionary *> *posts =
@@ -792,7 +956,7 @@ static void HRQueueRecordCheck(NSString *name) {
 // posts are yours goes by it.
 static void HRLookUpAccount(void) {
   NSString *authorization = gAuthorization;
-  HRSend(HRGetRequest(kHRMeURL, @{@"raw_json" : @"1"}, authorization), kHRLookUpGap,
+  HRSend(HRGetRequest(kHRMeURL, @{@"raw_json" : @"1"}, authorization), kHRLookUpGap, NO,
          ^(NSData *data, NSURLResponse *response, NSError *error) {
            NSInteger status = HRStatusCode(response);
            id json = !error && status >= 200 && status < 300 && data.length
@@ -801,7 +965,10 @@ static void HRLookUpAccount(void) {
            id name = [json isKindOfClass:NSDictionary.class] ? ((NSDictionary *)json)[@"name"] : nil;
            id ident = [json isKindOfClass:NSDictionary.class] ? ((NSDictionary *)json)[@"id"] : nil;
            if (![name isKindOfClass:NSString.class] || ![(NSString *)name length]) {
-             HRHandleFailure(nil, response, error, data, authorization);
+             if ([json isKindOfClass:NSDictionary.class])
+               HRNoteLoggedOutSignIn(authorization, response);
+             else
+               HRHandleFailure(nil, response, error, data, authorization);
              return;
            }
            if (gAccountForSignIn.count >= 8) [gAccountForSignIn removeAllObjects];
@@ -823,7 +990,7 @@ static void HRListOwnPosts(void) {
   gOwnListedAt = CFAbsoluteTimeGetCurrent();  // after a failure too: asked again in ten minutes
   HRSend(HRGetRequest(url, @{@"limit" : @"100", @"sort" : @"new", @"show" : @"all", @"raw_json" : @"1"},
                       authorization),
-         kHRLookUpGap, ^(NSData *data, NSURLResponse *response, NSError *error) {
+         kHRLookUpGap, NO, ^(NSData *data, NSURLResponse *response, NSError *error) {
            NSInteger status = HRStatusCode(response);
            NSDictionary<NSString *, NSDictionary *> *posts =
                !error && status >= 200 && status < 300 ? HRPostsInListing(data) : nil;
@@ -844,9 +1011,9 @@ static void HRListOwnPosts(void) {
 static void HRCheckRecordStep(void) {
   NSArray<NSString *> *chunk = [gToCheck.array subarrayWithRange:NSMakeRange(0, MIN(gToCheck.count, kHRInfoBatch))];
   NSString *authorization = gAuthorization;
-  NSURLRequest *request =
+  NSMutableURLRequest *request =
       HRGetRequest(kHRInfoURL, @{@"id" : [chunk componentsJoinedByString:@","], @"raw_json" : @"1"}, authorization);
-  HRSend(request, kHRLookUpGap, ^(NSData *data, NSURLResponse *response, NSError *error) {
+  HRSend(request, kHRLookUpGap, NO, ^(NSData *data, NSURLResponse *response, NSError *error) {
     NSInteger status = HRStatusCode(response);
     NSDictionary<NSString *, NSDictionary *> *posts =
         !error && status >= 200 && status < 300 ? HRPostsInListing(data) : nil;
@@ -874,7 +1041,7 @@ static void HRCheckRecordStep(void) {
 static void HRSendUnhide(void) {
   NSArray<NSString *> *batch = [gUnhide.array subarrayWithRange:NSMakeRange(0, MIN(gUnhide.count, kHRBatchSize))];
   NSString *authorization = gAuthorization;
-  HRSend(HRPostsRequest(kHRUnhideURL, batch, authorization), kHRBulkGap,
+  HRSend(HRPostsRequest(kHRUnhideURL, batch, authorization), kHRBulkGap, NO,
          ^(NSData *data, NSURLResponse *response, NSError *error) {
            NSInteger status = HRStatusCode(response);
            if (error || status < 200 || status >= 300) {
@@ -897,26 +1064,495 @@ static void HRSendUnhide(void) {
          });
 }
 
+#pragma mark - The app's own way
+
+// When Reddit's API won't take the app's sign-in (it turns it down, or answers
+// as if no one were logged in), posts are hidden the way the app itself hides
+// one: its own GraphQL request for ⋯ → Hide post. Jax Reddit Eclipse learns it
+// the first time you hide a post yourself, once Reddit says that worked: what
+// the request goes to, its body with the post left out, and its headers about
+// the request itself (the operation). That's kept in the user defaults, never
+// the sign-in or anything that says who you are. Each read post then goes the
+// same way, one at a time, every 3 seconds (2 during "Hide All Read Posts
+// Now"), through the app's own session with the headers and sign-in of its
+// latest GraphQL request. Before a post goes, Reddit is asked who posted it
+// (GET /api/info, 25 at a time), and yours are left out; if Reddit won't say,
+// it goes by the posts known to be yours. It only runs once your account is
+// known, so your posts can be told apart. Three posts in a row Reddit won't
+// hide that way (or one, for a request learned without seeing Reddit's answer)
+// and it's forgotten until you hide a post yourself again: the app may have
+// changed how it does it.
+
+// Not a request to hide a post: one to unhide (or undo a hide), report, block
+// or remove.
+static BOOL HRIsOtherAction(NSString *lowered) {
+  for (NSString *word in @[
+         @"unhid", @"undo", @"restore", @"report", @"block", @"mute", @"spam", @"remove", @"delete", @"ban", @"flag",
+         @"award", @"vote", @"save", @"follow", @"subscri", @"comment", @"subreddit", @"community", @"user",
+         @"redditor"
+       ])
+    if ([lowered containsString:word]) return YES;
+  return NO;
+}
+
+// Whether the variables say to unhide (a state of "NONE", isHidden: false...),
+// or carry what goes with a report (a reason, a rule).
+static BOOL HRVariablesSayOtherwise(id object, NSString *key, NSUInteger depth) {
+  if (depth > 5) return YES;
+  NSString *loweredKey = key.lowercaseString ?: @"";
+  for (NSString *word in @[ @"reason", @"rule", @"report", @"message", @"comment" ])
+    if ([loweredKey containsString:word]) return YES;
+  if ([object isKindOfClass:NSDictionary.class]) {
+    for (id childKey in (NSDictionary *)object)
+      if (HRVariablesSayOtherwise(((NSDictionary *)object)[childKey],
+                                  [childKey isKindOfClass:NSString.class] ? childKey : nil, depth + 1))
+        return YES;
+    return NO;
+  }
+  if ([object isKindOfClass:NSArray.class]) {
+    for (id child in (NSArray *)object)
+      if (HRVariablesSayOtherwise(child, key, depth + 1)) return YES;
+    return NO;
+  }
+  BOOL stateKey = [loweredKey containsString:@"hid"] || [loweredKey containsString:@"state"];
+  if (stateKey && [object isKindOfClass:NSString.class]) {
+    NSString *value = [(NSString *)object lowercaseString];
+    return [@[ @"none", @"unhidden", @"unhide", @"visible", @"shown", @"not_hidden", @"nothidden", @"false" ]
+        containsObject:value];
+  }
+  if (stateKey && [object isKindOfClass:NSNumber.class]) return ![(NSNumber *)object boolValue];
+  return NO;
+}
+
+// The posts ("t3_...", the whole string) anywhere in the variables.
+static void HRCollectPostIDs(id object, NSUInteger depth, NSMutableSet<NSString *> *found) {
+  if (depth > 6 || found.count > 2) return;
+  if ([object isKindOfClass:NSString.class]) {
+    NSString *string = object;
+    if (string.length > 3 && [string hasPrefix:@"t3_"] &&
+        [string rangeOfString:@"^t3_[0-9a-z]+$" options:NSRegularExpressionSearch].location != NSNotFound)
+      [found addObject:string];
+  } else if ([object isKindOfClass:NSDictionary.class]) {
+    for (id value in [(NSDictionary *)object allValues]) HRCollectPostIDs(value, depth + 1, found);
+  } else if ([object isKindOfClass:NSArray.class]) {
+    for (id value in (NSArray *)object) HRCollectPostIDs(value, depth + 1, found);
+  }
+}
+
+// `object` with every string that is `postID` swapped for the placeholder;
+// `count` says how many.
+static id HRWithPlaceholder(id object, NSString *postID, NSUInteger depth, NSUInteger *count) {
+  if (depth > 8) return object;
+  if ([object isKindOfClass:NSString.class]) {
+    if (![(NSString *)object isEqualToString:postID]) return object;
+    (*count)++;
+    return kHRPostPlaceholder;
+  }
+  if ([object isKindOfClass:NSDictionary.class]) {
+    NSMutableDictionary *copy = [NSMutableDictionary dictionary];
+    [(NSDictionary *)object enumerateKeysAndObjectsUsingBlock:^(id key, id value, BOOL *stop) {
+      copy[key] = HRWithPlaceholder(value, postID, depth + 1, count);
+    }];
+    return copy;
+  }
+  if ([object isKindOfClass:NSArray.class]) {
+    NSMutableArray *copy = [NSMutableArray array];
+    for (id value in (NSArray *)object) [copy addObject:HRWithPlaceholder(value, postID, depth + 1, count)];
+    return copy;
+  }
+  return object;
+}
+
+// If `request` is the app hiding one post (⋯ → Hide post): what Jax Reddit
+// Eclipse keeps of it (url, body with the post left out, headers about the
+// request, operation), and the post in `postIDOut`. Nil for anything else. Any
+// thread.
+static NSDictionary *HRLearnableHideRequest(NSURLRequest *request, NSData *body, NSString **postIDOut) {
+  if (![request.HTTPMethod.uppercaseString isEqualToString:@"POST"] || body.length == 0 || body.length > 16 * 1024)
+    return nil;
+  // Most requests name their operation in a header: no need to read their body.
+  NSString *named = [request valueForHTTPHeaderField:@"X-APOLLO-OPERATION-NAME"].lowercaseString;
+  if (named.length && ![named containsString:@"hide"] && ![named containsString:@"hidden"]) return nil;
+  NSString *operation = nil;
+  NSDictionary *variables = nil;
+  HRParseGraphQLRequest(request, body, &operation, &variables);
+  NSString *lowered = operation.lowercaseString;
+  if (![lowered containsString:@"hide"] && ![lowered containsString:@"hidden"]) return nil;
+  if (HRIsOtherAction(lowered) || !variables.count) return nil;
+  NSData *variablesData = [NSJSONSerialization dataWithJSONObject:variables options:0 error:NULL];
+  if (!variablesData || variablesData.length > 600 || HRVariablesSayOtherwise(variables, nil, 0)) return nil;
+  NSMutableSet<NSString *> *postIDs = [NSMutableSet set];
+  HRCollectPostIDs(variables, 0, postIDs);
+  if (postIDs.count != 1) return nil;
+  NSString *postID = postIDs.anyObject;
+
+  id json = [NSJSONSerialization JSONObjectWithData:body options:0 error:NULL];
+  if (![json isKindOfClass:NSDictionary.class] || ![((NSDictionary *)json)[@"variables"] isKindOfClass:NSDictionary.class])
+    return nil;
+  NSMutableDictionary *template = [(NSDictionary *)json mutableCopy];
+  NSUInteger replaced = 0;
+  template[@"variables"] = HRWithPlaceholder(template[@"variables"], postID, 0, &replaced);
+  if (!replaced) return nil;
+  NSData *templateData = [NSJSONSerialization dataWithJSONObject:template
+                                                         options:NSJSONWritingWithoutEscapingSlashes
+                                                           error:NULL];
+  NSString *templateBody = templateData ? [[NSString alloc] initWithData:templateData encoding:NSUTF8StringEncoding] : nil;
+  NSString *url = request.URL.absoluteString;
+  if (!templateBody.length || !url.length) return nil;
+
+  // Only the headers about the request itself: who's asking comes from the app's
+  // latest request each time.
+  NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+  [request.allHTTPHeaderFields enumerateKeysAndObjectsUsingBlock:^(NSString *name, NSString *value, BOOL *stop) {
+    NSString *lowerName = name.lowercaseString;
+    if ([lowerName containsString:@"apollo"] || [lowerName containsString:@"operation"] ||
+        [lowerName isEqualToString:@"content-type"] || [lowerName isEqualToString:@"accept"])
+      headers[name] = value;
+  }];
+  if (postIDOut) *postIDOut = postID;
+  return @{@"url" : url, @"body" : templateBody, @"headers" : headers, @"operation" : operation};
+}
+
+// Whether Reddit says a GraphQL request worked: HTTP 2xx, JSON with data, no
+// errors, and nothing in it that says it didn't ("ok": false). Otherwise
+// `problem` says what Reddit said.
+static BOOL HRSaysNotDone(id object, NSUInteger depth) {
+  if (depth > 4) return NO;
+  if ([object isKindOfClass:NSDictionary.class]) {
+    NSDictionary *dict = object;
+    for (id key in dict) {
+      id value = dict[key];
+      NSString *lowered = [key isKindOfClass:NSString.class] ? [(NSString *)key lowercaseString] : @"";
+      if (([lowered isEqualToString:@"ok"] || [lowered isEqualToString:@"success"] ||
+           [lowered isEqualToString:@"issuccess"]) &&
+          [value isKindOfClass:NSNumber.class] && ![(NSNumber *)value boolValue])
+        return YES;
+      if ([lowered isEqualToString:@"errors"] && [value isKindOfClass:NSArray.class] && [(NSArray *)value count])
+        return YES;
+      if (HRSaysNotDone(value, depth + 1)) return YES;
+    }
+  } else if ([object isKindOfClass:NSArray.class]) {
+    for (id value in (NSArray *)object)
+      if (HRSaysNotDone(value, depth + 1)) return YES;
+  }
+  return NO;
+}
+
+static BOOL HRAppWaySucceeded(NSData *data, NSURLResponse *response, NSError *error,
+                              NSString *__strong *problem) {
+  NSInteger status = HRStatusCode(response);
+  if (error) {
+    *problem = error.localizedDescription;
+    return NO;
+  }
+  NSString *excerpt = HRAnswerExcerpt(data);
+  if (status < 200 || status >= 300) {
+    *problem = [NSString stringWithFormat:@"HTTP %ld%@", (long)status, excerpt];
+    return NO;
+  }
+  id json = data.length ? [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL] : nil;
+  if (![json isKindOfClass:NSDictionary.class]) {
+    *problem = [@"an answer that isn't JSON" stringByAppendingString:excerpt];
+    return NO;
+  }
+  id errors = ((NSDictionary *)json)[@"errors"];
+  if ([errors isKindOfClass:NSArray.class] && [(NSArray *)errors count]) {
+    id first = [(NSArray *)errors firstObject];
+    id message = [first isKindOfClass:NSDictionary.class] ? ((NSDictionary *)first)[@"message"] : nil;
+    *problem = [message isKindOfClass:NSString.class] ? message : [@"errors" stringByAppendingString:excerpt];
+    return NO;
+  }
+  id payload = ((NSDictionary *)json)[@"data"];
+  BOOL anything = NO;
+  if ([payload isKindOfClass:NSDictionary.class])
+    for (id value in [(NSDictionary *)payload allValues])
+      if (value != NSNull.null) anything = YES;
+  if (!anything || HRSaysNotDone(payload, 0)) {
+    *problem = [@"an answer that says it didn't" stringByAppendingString:excerpt];
+    return NO;
+  }
+  return YES;
+}
+
+// The sign-in to hide posts with the app's own way: the latest one on the app's
+// GraphQL requests, but not one Reddit's API answers as if no one were logged in
+// while the app has another (it can use more than one).
+static NSString *HRGraphQLSignIn(void) {
+  for (NSString *signIn in gRecentGraphQLSignIns.reverseObjectEnumerator)
+    if (![gAnonymousSignIns containsObject:signIn]) return signIn;
+  return gRecentGraphQLSignIns.lastObject;
+}
+
+// The sign-in to look posts up with (who posted them, which is public): the
+// latest one Reddit hasn't turned down.
+static NSString *HRLookUpSignIn(void) {
+  for (NSString *signIn in gRecentSignIns.reverseObjectEnumerator)
+    if (![gRefusedSignIns containsObject:signIn]) return signIn;
+  return gRecentSignIns.lastObject;
+}
+
+static BOOL HRCanHideTheAppsWay(void) {
+  return gAppHideRequest && gRecentGraphQLSignIns.count && HRKnowsOwnAccount();
+}
+
+// The app hid a post, and Reddit said that worked (or, for a request Jax Reddit
+// Eclipse couldn't see the answer to, `confirmed` is NO): kept as the way to hide
+// posts while Reddit's API won't take the sign-in. A confirmed one isn't
+// replaced by an unconfirmed one.
+static void HRLearnAppHideRequest(NSDictionary *learned, NSString *postID, BOOL confirmed) {
+  if (!confirmed && [gAppHideRequest[@"confirmed"] boolValue]) return;
+  BOOL same = [gAppHideRequest[@"body"] isEqual:learned[@"body"]] && [gAppHideRequest[@"url"] isEqual:learned[@"url"]];
+  BOOL could = HRCanHideTheAppsWay();
+  NSMutableDictionary *saved = [learned mutableCopy];
+  saved[@"confirmed"] = @(confirmed);
+  gAppHideRequest = saved;
+  gAppWayFailures = 0;
+  [NSUserDefaults.standardUserDefaults setObject:saved forKey:kHRAppHideRequestKey];
+  // That post is on your Hidden list now, if it was a read post (not one of
+  // yours): it isn't sent again.
+  if (confirmed && postID && !HRIsOwnPost(postID) &&
+      ([gPending containsObject:postID] || [gBulk containsObject:postID] ||
+       [HideReadStore.sharedStore containsPostID:postID])) {
+    gRecord[postID] = @(NSDate.date.timeIntervalSince1970);
+    HRSaveRecordSoon();
+    NSUInteger fromBulk = HRTakeOut(@[ postID ]);
+    gBulkDone += fromBulk;
+    gBulkHidden += fromBulk;
+    [gChecked removeObject:postID];
+  }
+  if (!same || !could)
+    HRLog(@"[account] learned how the Reddit app hides a post (%@%@): while Reddit's API won't take the app's "
+          @"sign-in, read posts are hidden on your account that way%@",
+          learned[@"operation"], confirmed ? @"" : @", not confirmed by Reddit yet",
+          HRKnowsOwnAccount() ? @"" : @", once your account is known");
+  if (gProblem && !gAuthorization) gProblem = nil;
+  HRStatusChanged();
+  HRConsiderSending();
+}
+
+static void HRForgetAppHideRequest(NSString *problem) {
+  HRLog(@"[account] hiding posts the Reddit app's own way stopped working (%@); hide one post yourself (⋯ → Hide "
+        @"post) to show Jax Reddit Eclipse again",
+        problem);
+  gAppHideRequest = nil;
+  gAppWayFailures = 0;
+  [NSUserDefaults.standardUserDefaults removeObjectForKey:kHRAppHideRequestKey];
+  gProblem = @"Hiding posts the Reddit app’s own way stopped working.";
+  HRTellProblem(@"Couldn’t hide your read posts the Reddit app’s own way. Hide one post yourself (⋯ → Hide post), "
+                @"and Jax Reddit Eclipse will hide the rest the same way.");
+}
+
+// The app's hide request with `postID` in it, the app's latest headers and
+// sign-in, or nil.
+static NSMutableURLRequest *HRAppWayRequest(NSString *postID) {
+  NSURL *url = [NSURL URLWithString:gAppHideRequest[@"url"]];
+  NSString *body = [gAppHideRequest[@"body"] stringByReplacingOccurrencesOfString:kHRPostPlaceholder
+                                                                        withString:postID];
+  NSString *signIn = HRGraphQLSignIn();
+  if (!url || !body.length || !signIn) return nil;
+  NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+  request.HTTPMethod = @"POST";
+  NSDictionary *headers = gAppHideRequest[@"headers"];
+  for (id name in headers)
+    if ([name isKindOfClass:NSString.class] && [headers[name] isKindOfClass:NSString.class])
+      [request setValue:headers[name] forHTTPHeaderField:name];
+  HRDressRequest(request, signIn);
+  if (![request valueForHTTPHeaderField:@"Content-Type"])
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+  request.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+  return request;
+}
+
+static void HRAppWayFailed(NSString *postID, NSURLResponse *response, NSError *error, NSString *problem,
+                           NSDictionary *used) {
+  NSInteger status = HRStatusCode(response);
+  if (error || status == 0 || status == 401 || status == 408 || status == 429 || status >= 500) {
+    // No connection, trouble on Reddit's side, too many requests, or a sign-in
+    // that just ran out (the app's next request brings a new one): a pause.
+    gBackoff = gBackoff ? MIN(gBackoff * 2, kHRMaxBackoff) : 60;
+    gNextAllowed = MAX(gNextAllowed, CFAbsoluteTimeGetCurrent() + gBackoff);
+    gProblem = [NSString stringWithFormat:@"Couldn’t reach Reddit to hide posts (%@).",
+                                          error ? error.localizedDescription
+                                                : [NSString stringWithFormat:@"HTTP %ld", (long)status]];
+    HRLog(@"[account] couldn't hide %@ the Reddit app's own way (%@); trying again in %.0f seconds",
+          HRDescribePost(postID), problem, gBackoff);
+    HRTellProblem([gProblem stringByAppendingFormat:@" Trying again in %.0f seconds.", gBackoff]);
+    return;
+  }
+  if (used != gAppHideRequest) return;  // learned again meanwhile
+  gAppWayFailures++;
+  if (![used[@"confirmed"] boolValue] || gAppWayFailures >= 3 ||
+      [problem.lowercaseString containsString:@"persisted"]) {
+    HRForgetAppHideRequest(problem);
+    return;
+  }
+  // Reddit won't hide this one (it was deleted, say): left out rather than sent forever.
+  gBulkDone += HRTakeOut(@[ postID ]);
+  [gChecked removeObject:postID];
+  HRLog(@"[account] Reddit wouldn't hide %@ the Reddit app's own way (%@); left it out", HRDescribePost(postID),
+        problem);
+}
+
+static void HRHideTheAppsWay(NSString *postID) {
+  NSMutableURLRequest *request = HRAppWayRequest(postID);
+  if (!request) {
+    HRForgetAppHideRequest(@"it couldn't be made into a request");
+    return;
+  }
+  BOOL bulkRunning = gBulkTotal > 0;
+  NSDictionary *used = gAppHideRequest;
+  HRSend(request, HRBulkCanSend() ? kHRBulkGap : kHRAppWayGap, YES,
+         ^(NSData *data, NSURLResponse *response, NSError *error) {
+           NSString *problem = nil;
+           if (HRAppWaySucceeded(data, response, error, &problem)) {
+             gRecord[postID] = @(NSDate.date.timeIntervalSince1970);
+             HRSaveRecordSoon();
+             NSUInteger fromBulk = HRTakeOut(@[ postID ]);
+             gBulkDone += fromBulk;
+             gBulkHidden += fromBulk;
+             [gChecked removeObject:postID];
+             gAppWayFailures = 0;
+             gProblem = nil;
+             gHiddenThisRun++;
+             if (used == gAppHideRequest && ![used[@"confirmed"] boolValue]) {
+               NSMutableDictionary *confirmed = [used mutableCopy];
+               confirmed[@"confirmed"] = @YES;
+               gAppHideRequest = confirmed;
+               [NSUserDefaults.standardUserDefaults setObject:confirmed forKey:kHRAppHideRequestKey];
+             }
+             // The first one, then every 25, and when nothing's left.
+             NSUInteger waiting = gPending.count + gBulk.count;
+             gAppWayLogged++;
+             if (!gToldAppWay || gAppWayLogged >= 25 || !waiting) {
+               HRLog(@"[account] hid %@ on your Reddit account the Reddit app's own way (%lu since Reddit "
+                     @"opened, %lu waiting)",
+                     gAppWayLogged > 1 ? [NSString stringWithFormat:@"%lu more posts", (unsigned long)gAppWayLogged]
+                                       : HRDescribePost(postID),
+                     (unsigned long)gHiddenThisRun, (unsigned long)waiting);
+               gToldAppWay = YES;
+               gAppWayLogged = 0;
+             }
+           } else {
+             HRAppWayFailed(postID, response, error, problem, used);
+           }
+           if (bulkRunning && !gBulk.count) HRFinishBulk();
+         });
+}
+
+// Who posted the next posts to hide the app's own way (GET /api/info): yours
+// are left out. If Reddit won't say, it goes by the posts known to be yours.
+static void HRCheckAuthorsTheAppsWay(NSArray<NSString *> *batch) {
+  NSString *authorization = HRLookUpSignIn();
+  NSMutableURLRequest *request =
+      HRGetRequest(kHRInfoURL, @{@"id" : [batch componentsJoinedByString:@","], @"raw_json" : @"1"}, authorization);
+  HRSend(request, kHRLookUpGap, NO, ^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSInteger status = HRStatusCode(response);
+    BOOL bulkRunning = gBulkTotal > 0;
+    NSDictionary<NSString *, NSDictionary *> *posts =
+        !error && status >= 200 && status < 300 ? HRPostsInListing(data) : nil;
+    if (!posts && (error || status == 0 || status == 408 || status == 429 || status >= 500)) {
+      gBackoff = gBackoff ? MIN(gBackoff * 2, kHRMaxBackoff) : 60;
+      gNextAllowed = MAX(gNextAllowed, CFAbsoluteTimeGetCurrent() + gBackoff);
+      HRLog(@"[account] couldn't look up who posted the posts to hide (%@); trying again in %.0f seconds",
+            error ? error.localizedDescription : [NSString stringWithFormat:@"HTTP %ld", (long)status], gBackoff);
+      return;
+    }
+    if (!posts && !gToldUncheckedAuthors) {
+      gToldUncheckedAuthors = YES;
+      HRLog(@"[account] Reddit won't say who posted the posts to hide (HTTP %ld%@); going by the posts known to "
+            @"be yours",
+            (long)status, HRAnswerExcerpt(data));
+    }
+    NSMutableArray<NSString *> *yours = [NSMutableArray array];
+    for (NSString *postID in batch) {
+      NSDictionary *post = posts[postID];
+      if (HRIsOwnPost(postID) || (post && HRIsYours(post))) {
+        [yours addObject:postID];
+        continue;
+      }
+      if ([gPending containsObject:postID] || [gBulk containsObject:postID]) [gChecked addObject:postID];
+    }
+    if (yours.count) {
+      for (NSString *postID in yours)
+        if (!HRIsOwnPost(postID))
+          HRLog(@"[own] %@ is your post, so it isn't hidden on your account", HRDescribePost(postID));
+      HRDropFromQueues(yours);
+      HRAddOwnPosts(yours);
+      if (bulkRunning && !gBulk.count) HRFinishBulk();
+    }
+  });
+}
+
+// The next step the app's own way: a post already checked, else the next 25 to check.
+static void HRSendTheAppsWay(void) {
+  NSMutableArray<NSString *> *gone = [NSMutableArray array];
+  NSString *next = nil;
+  for (NSString *postID in gChecked) {
+    BOOL pending = [gPending containsObject:postID];
+    BOOL bulk = [gBulk containsObject:postID];
+    if ((!pending && !bulk) || HRIsOwnPost(postID)) {
+      [gone addObject:postID];
+      continue;
+    }
+    if (!next && (pending || HRBulkCanSend())) next = postID;
+  }
+  [gChecked removeObjectsInArray:gone];
+  if (next) {
+    HRHideTheAppsWay(next);
+    return;
+  }
+  NSMutableOrderedSet<NSString *> *batch = [NSMutableOrderedSet orderedSet];
+  for (NSString *postID in gPending) {
+    if (batch.count == kHRBatchSize) break;
+    if (![gChecked containsObject:postID]) [batch addObject:postID];
+  }
+  if (HRBulkCanSend())
+    for (NSString *postID in gBulk) {
+      if (batch.count == kHRBatchSize) break;
+      if (![gChecked containsObject:postID]) [batch addObject:postID];
+    }
+  if (batch.count) HRCheckAuthorsTheAppsWay([[NSArray alloc] initWithArray:batch.array]);
+}
+
 // What goes to Reddit next, one request at a time: your account, for a new
 // sign-in; while Reddit is open, your posts to unhide, your newest posts to
 // list, and the record to check for yours; then posts to hide, those just
 // counted as read first, then the read history, each batch checked for yours.
+// While Reddit's API won't take the app's sign-in: the app's own way.
 static void HRSendBatch(void) {
-  if (gSending || gStopped) return;
+  if (gSending) return;
+  BOOL appsWay = (!gAuthorization || gStopped) && HRCanHideTheAppsWay();
+  if (gStopped && !appsWay) return;
   if (gPending.count && !HRAccountHidingOn()) {
     // Turned off since these were counted.
     [gPending removeAllObjects];
+    [gChecked removeAllObjects];
     HRSavePending();
     HRStatusChanged();
   }
   if (!HRHousekeepingDue() && !gPending.count && !HRBulkCanSend()) return;
-  if (!gAuthorization) {
+  if (!gAuthorization && !appsWay) {
     HRConsiderSending();  // waits for the app's sign-in
     return;
   }
   CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
   if (now < gNextAllowed) {
     HRArmSend(gNextAllowed - now);
+    return;
+  }
+  if (appsWay) {
+    // Posts already known to be yours never go.
+    NSMutableArray<NSString *> *yours = [NSMutableArray array];
+    for (NSString *postID in gPending)
+      if (HRIsOwnPost(postID)) [yours addObject:postID];
+    for (NSString *postID in gBulk)
+      if (HRIsOwnPost(postID)) [yours addObject:postID];
+    if (yours.count) {
+      BOOL bulkRunning = gBulkTotal > 0;
+      HRDropFromQueues(yours);
+      if (bulkRunning && !gBulk.count) HRFinishBulk();
+    }
+    HRSendTheAppsWay();
     return;
   }
 
@@ -977,9 +1613,27 @@ static NSString *HRStatusLine(void) {
   else if (gLastBulkHidden)
     [parts addObject:[NSString stringWithFormat:@"Hid %@ read posts.", HRCount(gLastBulkHidden)]];
 
-  if (gStopped)
+  BOOL apiRefused = gStopped || gRefusedSignIns.count > 0 || gAnonymousSignIns.count > 0;
+  BOOL appsWay = (!gAuthorization || gStopped) && HRCanHideTheAppsWay();
+  if (appsWay && waiting) {
+    if (gProblem && gNextAllowed > now + 1)
+      [parts addObject:[gProblem stringByAppendingFormat:@" Trying again in %.0f seconds.", gNextAllowed - now]];
+    else
+      [parts addObject:[NSString stringWithFormat:@"Hiding them the Reddit app’s own way, one at a time: %@ "
+                                                  @"waiting.",
+                                                  HRCount(waiting)]];
+  } else if (waiting && (gStopped || !gAuthorization) && apiRefused) {
+    // Reddit's API won't take the app's sign-in, and the app's own way isn't ready.
+    NSString *why = gStopped ? @"Reddit refused the app’s sign-in three times."
+                             : (gProblem ?: @"Reddit’s API won’t take the Reddit app’s sign-in.");
+    NSString *next = gAppHideRequest ? @" Waiting to learn which Reddit account is yours, so your own posts are "
+                                       @"never hidden."
+                                     : @" To hide them anyway, hide one post yourself (⋯ → Hide post): Jax Reddit "
+                                       @"Eclipse then hides the rest the same way.";
+    [parts addObject:[why stringByAppendingString:next]];
+  } else if (gStopped) {
     [parts addObject:@"Stopped: Reddit refused the app’s sign-in three times. Reopen Reddit to retry."];
-  else if (waiting && !gAuthorization)
+  } else if (waiting && !gAuthorization)
     [parts addObject:gProblem ? [gProblem stringByAppendingString:@" Waiting for the app’s next sign-in, picked up "
                                                                   @"when a feed loads."]
                               : @"Waiting for the app’s sign-in, picked up when a feed loads."];
@@ -999,6 +1653,8 @@ static NSString *HRStatusLine(void) {
   if (!parts.count) {
     if (!on) return @"Off: read posts are only left out of this app’s feeds.";
     if (gHiddenThisRun) return [NSString stringWithFormat:@"%@ hidden since Reddit opened.", HRCount(gHiddenThisRun)];
+    if (!gAuthorization && HRCanHideTheAppsWay())
+      return @"Nothing waiting. Read posts go to your account the Reddit app’s own way.";
     if (!gAuthorization) return @"Nothing waiting. The app’s sign-in is picked up when a feed loads.";
     return @"Nothing waiting.";
   }
@@ -1022,50 +1678,124 @@ NSDictionary<NSString *, id> *HRAccountHiderStatus(void) {
 
 #pragma mark - Entry points
 
+BOOL HRAccountHiderIsOwnRequest(NSURLRequest *request) {
+  return request && [[NSURLProtocol propertyForKey:kHROwnRequestKey inRequest:request] boolValue];
+}
+
+// gql.reddit.com, gql-fed.reddit.com, cf.gql-fed.reddit.com...
+static BOOL HRIsGraphQLHost(NSString *host) {
+  for (NSString *label in [host.lowercaseString componentsSeparatedByString:@"."])
+    if ([label hasPrefix:@"gql"]) return YES;
+  return NO;
+}
+
 void HRAccountHiderNoteRequest(NSURLSession *session, NSURLRequest *request) {
   // Only from Reddit's API hosts (gql…, oauth…), the ones the hiding requests go
   // to: other Reddit hosts can carry other kinds of sign-in.
-  if (!HRShouldProcessRequest(request)) return;
+  if (!HRShouldProcessRequest(request) || HRAccountHiderIsOwnRequest(request)) return;
   NSString *host = request.URL.host;
-  if (gSession && session == gSession) return;  // our own
+  if (!session || (gSession && session == gSession)) return;  // our own
+  NSDictionary *extra = session.configuration.HTTPAdditionalHeaders;
   NSString *authorization = [request valueForHTTPHeaderField:@"Authorization"];
-  NSDictionary *extra = nil;
-  if (!authorization.length) {
-    extra = session.configuration.HTTPAdditionalHeaders;
-    if ([extra[@"Authorization"] isKindOfClass:NSString.class]) authorization = extra[@"Authorization"];
-  }
+  if (!authorization.length && [extra[@"Authorization"] isKindOfClass:NSString.class])
+    authorization = extra[@"Authorization"];
   if (authorization.length < 40 ||
       [authorization rangeOfString:@"Bearer " options:NSCaseInsensitiveSearch | NSAnchoredSearch].location ==
           NSNotFound)
     return;
   NSString *agent = [request valueForHTTPHeaderField:@"User-Agent"];
-  if (!agent.length) {
-    if (!extra) extra = session.configuration.HTTPAdditionalHeaders;
-    if ([extra[@"User-Agent"] isKindOfClass:NSString.class]) agent = extra[@"User-Agent"];
+  if (!agent.length && [extra[@"User-Agent"] isKindOfClass:NSString.class]) agent = extra[@"User-Agent"];
+  // The headers that say who's asking, the session's and then the request's own.
+  NSMutableDictionary<NSString *, NSString *> *headers = [NSMutableDictionary dictionary];
+  NSMutableDictionary<NSString *, NSString *> *namesByLowered = [NSMutableDictionary dictionary];
+  NSMutableSet<NSString *> *allNames = [NSMutableSet set];
+  NSMutableArray<NSDictionary *> *headerSets = [NSMutableArray array];
+  if ([extra isKindOfClass:NSDictionary.class]) [headerSets addObject:extra];
+  if (request.allHTTPHeaderFields) [headerSets addObject:request.allHTTPHeaderFields];
+  for (NSDictionary *fields in headerSets) {
+    for (id name in fields) {
+      id value = fields[name];
+      if (![name isKindOfClass:NSString.class] || ![value isKindOfClass:NSString.class]) continue;
+      NSString *lowered = [(NSString *)name lowercaseString];
+      [allNames addObject:lowered];
+      if (!HRIsCopiedHeader(name)) continue;
+      NSString *previous = namesByLowered[lowered];
+      if (previous) [headers removeObjectForKey:previous];
+      namesByLowered[lowered] = name;
+      headers[name] = value;
+    }
   }
+  NSArray<NSString *> *copiedNames = [namesByLowered.allKeys sortedArrayUsingSelector:@selector(compare:)];
+  BOOL graphQL = HRIsGraphQLHost(host);
   NSString *path = request.URL.path ?: @"";
-  NSMutableSet<NSString *> *headerNames = [NSMutableSet set];
-  if (HRPref(HRPrefDiagnostics)) {
-    for (NSString *name in request.allHTTPHeaderFields) [headerNames addObject:name.lowercaseString];
-    for (id name in session.configuration.HTTPAdditionalHeaders)
-      if ([name isKindOfClass:NSString.class]) [headerNames addObject:((NSString *)name).lowercaseString];
-  }
   HRSetUp();
   dispatch_async(gQueue, ^{
     if (agent.length) gUserAgent = agent;
-    if ([authorization isEqualToString:gAuthorization] || [gRefusedSignIns containsObject:authorization]) return;
+    BOOL couldHideTheAppsWay = HRCanHideTheAppsWay();
+    gAppSession = session;
+    gAppHeaders = headers;
+    gAppHeaderNames = copiedNames;
+    [gRecentSignIns removeObject:authorization];
+    [gRecentSignIns addObject:authorization];
+    if (gRecentSignIns.count > 6) [gRecentSignIns removeObjectAtIndex:0];
+    if (graphQL) {
+      gAppGraphQLSession = session;
+      [gRecentGraphQLSignIns removeObject:authorization];
+      [gRecentGraphQLSignIns addObject:authorization];
+      if (gRecentGraphQLSignIns.count > 4) [gRecentGraphQLSignIns removeObjectAtIndex:0];
+    }
+    if (HRPref(HRPrefDiagnostics))
+      HRLogOnce(@"signin-headers", @"[account] the app's requests carry these headers: %@",
+                [[allNames.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]);
+    if ([authorization isEqualToString:gAuthorization] || [gRefusedSignIns containsObject:authorization] ||
+        [gAnonymousSignIns containsObject:authorization]) {
+      // The app's own way may have just become possible (its first GraphQL request).
+      if (!couldHideTheAppsWay && HRCanHideTheAppsWay()) {
+        HRStatusChanged();
+        HRConsiderSending();
+      }
+      return;
+    }
     BOOL first = !gAuthorization;
     gAuthorization = authorization;
     // Each sign-in once, with where it came from: the app may use more than one.
     HRLogOnce([@"signin:" stringByAppendingString:HRSignInTag(authorization)],
               @"[account] using the Reddit app's sign-in %@ (from a request to %@%@)", HRSignInTag(authorization),
               host, path);
-    if (headerNames.count)
-      HRLogOnce(@"signin-headers", @"[account] the app's requests carry these headers: %@",
-                [[headerNames.allObjects sortedArrayUsingSelector:@selector(compare:)] componentsJoinedByString:@", "]);
     if (first) HRStatusChanged();
     HRConsiderSending();
   });
+}
+
+// The app's own hide request (⋯ → Hide post), seen going out: learned from once
+// Reddit says it worked (see "The app's own way"). A request without a
+// completion handler (streamed) is learned from as it is, and checked by the
+// first post sent that way.
+HRAccountCompletionHandler HRAccountHiderWatchRequest(NSURLRequest *request, NSData *body,
+                                                      HRAccountCompletionHandler handler) {
+  if (!body.length || HRAccountHiderIsOwnRequest(request) || !HRIsGraphQLHost(request.URL.host)) return handler;
+  NSString *postID = nil;
+  NSDictionary *learned = HRLearnableHideRequest(request, body, &postID);
+  if (!learned) return handler;
+  HRSetUp();
+  if (!handler) {
+    dispatch_async(gQueue, ^{
+      HRLearnAppHideRequest(learned, postID, NO);
+    });
+    return handler;
+  }
+  return ^(NSData *data, NSURLResponse *response, NSError *error) {
+    NSData *answer = [data copy];
+    dispatch_async(gQueue, ^{
+      NSString *problem = nil;
+      if (HRAppWaySucceeded(answer, response, error, &problem))
+        HRLearnAppHideRequest(learned, postID, YES);
+      else
+        HRLog(@"[account] the Reddit app tried to hide %@ (%@), but Reddit answered %@; not learned from",
+              HRDescribePost(postID), learned[@"operation"], problem);
+    });
+    handler(data, response, error);
+  };
 }
 
 void HRAccountHiderQueue(NSString *postID) {
@@ -1225,9 +1955,13 @@ static void HRConfirmAllHidden(NSArray<NSString *> *postIDs, NSString *newest, N
 // isn't a few seconds later, a note says what's holding things up.
 static void HRTellIfStillWaiting(NSUInteger run) {
   dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)), gQueue, ^{
-    if (run != gBulkRun || !gBulkTotal || gAuthorization) return;
-    HRTellProblem(@"Waiting for the Reddit app’s sign-in to hide your read posts. Pull your feed down to "
-                  @"refresh it, and they’ll go.");
+    if (run != gBulkRun || !gBulkTotal || gAuthorization || HRCanHideTheAppsWay()) return;
+    if (gRefusedSignIns.count || gAnonymousSignIns.count)
+      HRTellProblem(@"Couldn’t hide your read posts: Reddit’s API won’t take the Reddit app’s sign-in. Hide one "
+                    @"post yourself (⋯ → Hide post), and Jax Reddit Eclipse will hide the rest the same way.");
+    else
+      HRTellProblem(@"Waiting for the Reddit app’s sign-in to hide your read posts. Pull your feed down to "
+                    @"refresh it, and they’ll go.");
   });
 }
 
@@ -1237,7 +1971,11 @@ void HRAccountHiderHideAllRead(BOOL showNote) {
   dispatch_async(gQueue, ^{
     gStopped = NO;
     gRefusals = 0;
-    [gRefusedSignIns removeAllObjects];  // you asked to try again: every sign-in gets another go
+    // You asked to try again: every sign-in gets another go.
+    [gRefusedSignIns removeAllObjects];
+    [gAnonymousSignIns removeAllObjects];
+    gToldUncheckedAuthors = NO;
+    if (!gAuthorization) gAuthorization = gRecentSignIns.lastObject;
     gBulkToldProblem = NO;
     if (!gBulkTotal) {
       gBulkDone = gBulkHidden = 0;
@@ -1262,7 +2000,7 @@ void HRAccountHiderHideAllRead(BOOL showNote) {
     HRStatusChanged();
 
     if (gBulk.count) {
-      if (!gAuthorization) HRTellIfStillWaiting(gBulkRun);
+      if (!gAuthorization && !HRCanHideTheAppsWay()) HRTellIfStillWaiting(gBulkRun);
       if (showNote) {
         NSString *note = [NSString stringWithFormat:@"Hiding %@ on your Reddit account…", HRReadPosts(gBulk.count)];
         dispatch_async(dispatch_get_main_queue(), ^{

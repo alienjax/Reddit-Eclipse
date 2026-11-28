@@ -21,6 +21,9 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (BOOL)containsPostID:(NSString *)postID;
 
+/// When `postID` was last counted as read (seconds since 1970), or 0 if it isn't.
+- (NSTimeInterval)readTimeForPostID:(NSString *)postID;
+
 /// Marks a post as read (or refreshes its timestamp). Returns YES if it was not
 /// already marked. Your own posts (HRIsOwnPost) are never marked.
 - (BOOL)markPostID:(NSString *)postID;

@@ -13,6 +13,11 @@ BOOL HRIsRedditHost(NSString *_Nullable host);
 /// header, its body, or its URL), or nil.
 NSString *_Nullable HROperationName(NSURLRequest *request, NSData *_Nullable body);
 
+/// The GraphQL operation a request runs and its variables, as HROperationName
+/// finds them; either may come back nil.
+void HRParseGraphQLRequest(NSURLRequest *request, NSData *_Nullable body, NSString *_Nullable *_Nullable operation,
+                           NSDictionary *_Nullable *_Nullable variables);
+
 /// YES if Jax Reddit Eclipse needs to see this operation's response: a feed it may hide
 /// read posts in, or a post page or comment load that says a post was opened.
 /// Everything else (telemetry, config, account calls...) passes through
@@ -35,6 +40,17 @@ NSString *_Nullable HRPostTitle(NSString *_Nullable postID);
 /// list is the one in which posts in `below` (cards on screen under it) come
 /// after it, and there must be one. Each is handed out once. Any thread.
 NSArray<NSString *> *HRTakePostsListedBefore(NSString *postID, NSArray<NSString *> *below);
+
+/// YES if Jax Reddit Eclipse handed `postID` to the app in a feed list along
+/// with at least one of `neighbors` (the cards around it on screen), or with no
+/// neighbors given, in any list. Any thread.
+BOOL HRIsListedWith(NSString *_Nullable postID, NSArray<NSString *> *neighbors);
+
+/// Diagnostics (with the log on): notes one of the app's requests to Reddit's
+/// API, with how Jax Reddit Eclipse handled it (nil: read), and lists those
+/// since `since` (CFAbsoluteTimeGetCurrent), oldest first, or "none". Any thread.
+void HRNoteAPIRequest(NSString *_Nullable operation, NSString *_Nullable how);
+NSString *HRRecentAPIRequests(CFAbsoluteTime since);
 
 /// Posts seen in feed responses since Reddit opened, read or not. Any thread.
 NSUInteger HRFeedPostsSeenCount(void);

@@ -39,6 +39,9 @@ static const NSUInteger kHRMaxWalkDepth = 12;
 @property (nonatomic) BOOL keptHiddenRow;   // a "Post hidden" row had to stay
 @property (nonatomic, strong) NSArray<NSString *> *listedPosts;  // the list's posts as handed on, in order
 @property (nonatomic, copy) NSString *listedCursor;              // and its endCursor
+@property (nonatomic, strong) NSSet<NSString *> *requested;      // posts the request names: never taken out of a
+                                                                 // list of units (a post's own page)
+@property (nonatomic) NSUInteger added;  // posts in lists of units with no edges around them (Reddit adding posts)
 @end
 
 @implementation HideReadFeedStats
@@ -229,6 +232,18 @@ static BOOL HRLooksLikeEdges(NSArray *array) {
     if ([((NSDictionary *)element)[@"node"] isKindOfClass:NSDictionary.class]) sawNode = YES;
   }
   return sawNode;
+}
+
+// A list of server-driven feed units ("CellGroup") with no edges around them,
+// at least one of them a post: how Reddit can add posts to a feed already on
+// screen (below a post you opened, say).
+static BOOL HRLooksLikeUnits(NSArray *array) {
+  BOOL post = NO;
+  for (id element in array) {
+    if (![element isKindOfClass:NSDictionary.class] || ![HRTypename(element) isEqualToString:@"CellGroup"]) return NO;
+    if (!post && HRPostIDForNode(element)) post = YES;
+  }
+  return post;
 }
 
 static BOOL HRHasMorePages(NSDictionary *container) {
@@ -507,20 +522,28 @@ static BOOL HRIsOldPost(NSDictionary *node, NSString *postID, HideReadFeedStats 
 // being unhidden) shows as a post. The list's pageInfo stays as it is, so the
 // next page loads as usual. A list left with nothing at all in it could stop the
 // feed from loading more, so then, when more pages exist, one post stays: the
-// last read one, else the last hidden one, shown as a post where it can be.
-static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadFeedStats *stats) {
+// last one only left out for its age if there is one (you haven't read it), else
+// the last read one, else the last hidden one, shown as a post where it can be.
+//
+// With `bare`, `edges` is a list of feed units with no edges around them, which
+// is how Reddit can add posts to a feed already on screen (below a post you
+// opened, say). A post the request itself names (the post a page is for) always
+// stays in one, and one with no paging can be left empty.
+static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, BOOL bare, HideReadFeedStats *stats) {
   HideReadStore *store = HideReadStore.sharedStore;
   BOOL crossposts = HRPref(HRPrefMarkCrossposts);
   NSMutableArray<NSNumber *> *readEdges = [NSMutableArray array];    // indexes, in order
   NSMutableArray<NSNumber *> *hiddenEdges = [NSMutableArray array];
+  NSMutableSet<NSNumber *> *oldOnly = [NSMutableSet set];           // indexes left out only for their age
   NSUInteger visiblePosts = 0;
 
   for (NSUInteger i = 0; i < edges.count; i++) {
     id edge = edges[i];
     if (![edge isKindOfClass:NSDictionary.class]) continue;
-    id node = ((NSDictionary *)edge)[@"node"];
+    id node = bare ? edge : ((NSDictionary *)edge)[@"node"];
     if (![node isKindOfClass:NSMutableDictionary.class] || !HRIsHideableNode(node)) continue;
     NSString *postID = HRPostIDForNode(node);
+    if (bare && postID && [stats.requested containsObject:postID]) continue;
     BOOL own = postID && HRCheckOwnPost(postID, node);
     if (HRIsAlreadyHidden(node)) {
       if (!(own && HRAccountHiderHid(postID) && HRShowHiddenNode(node))) {
@@ -538,20 +561,32 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
     visiblePosts++;
     if (stats.rememberTitles) HRRememberTitle(postID, node);
     if (own) continue;
-    if ([store containsPostID:postID] || (crossposts && HRSharesReadPost(node, postID, stats)) ||
-        (stats.postedBefore > 0 && HRIsOldPost(node, postID, stats)))
-      [readEdges addObject:@(i)];
+    BOOL read = [store containsPostID:postID] || (crossposts && HRSharesReadPost(node, postID, stats));
+    BOOL old = !read && stats.postedBefore > 0 && HRIsOldPost(node, postID, stats);
+    if (read || old) [readEdges addObject:@(i)];
+    if (old) [oldOnly addObject:@(i)];
   }
 
   stats.posts += visiblePosts;
+  if (bare) stats.added += visiblePosts;
   if (readEdges.count || hiddenEdges.count) {
-    if (readEdges.count + hiddenEdges.count == edges.count && HRHasMorePages(container)) {
+    BOOL paged = !bare || container[@"pageInfo"] != nil;
+    if (paged && readEdges.count + hiddenEdges.count == edges.count && HRHasMorePages(container)) {
       if (readEdges.count) {
-        [readEdges removeLastObject];
+        // Rather one you haven't read (only left out for its age) than one you have.
+        NSNumber *kept = readEdges.lastObject;
+        for (NSNumber *index in readEdges.reverseObjectEnumerator)
+          if ([oldOnly containsObject:index]) {
+            kept = index;
+            break;
+          }
+        [readEdges removeObject:kept];
+        if ([oldOnly containsObject:kept] && stats.old) stats.old--;
       } else {
         NSNumber *last = hiddenEdges.lastObject;
         [hiddenEdges removeLastObject];
-        if (HRShowHiddenNode(edges[last.unsignedIntegerValue][@"node"]))
+        NSDictionary *lastEdge = edges[last.unsignedIntegerValue];
+        if (HRShowHiddenNode(bare ? (NSMutableDictionary *)lastEdge : lastEdge[@"node"]))
           stats.shown++;
         else
           stats.keptHiddenRow = YES;
@@ -561,7 +596,8 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
     if (stats.diagnostics && readEdges.count) {
       if (!stats.hiddenTitles) stats.hiddenTitles = [NSMutableArray array];
       for (NSNumber *index in readEdges) {
-        NSString *postID = HRPostIDForNode(edges[index.unsignedIntegerValue][@"node"]);
+        NSDictionary *edge = edges[index.unsignedIntegerValue];
+        NSString *postID = HRPostIDForNode(bare ? edge : edge[@"node"]);
         NSString *title = HRTitleSuffix(postID);
         [stats.hiddenTitles addObject:title.length ? [title substringFromIndex:1] : postID];
       }
@@ -575,7 +611,10 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
         [(NSMutableArray *)edges removeObjectAtIndex:index.unsignedIntegerValue];
       stats.alreadyHidden += hiddenEdges.count;
     } else {
-      for (NSNumber *index in readEdges) HRHideNode(edges[index.unsignedIntegerValue][@"node"]);
+      for (NSNumber *index in readEdges) {
+        NSDictionary *edge = edges[index.unsignedIntegerValue];
+        HRHideNode(bare ? (NSMutableDictionary *)edge : edge[@"node"]);
+      }
     }
     stats.hidden += readEdges.count;
   }
@@ -585,7 +624,7 @@ static void HRHideReadInEdges(NSArray *edges, NSDictionary *container, HideReadF
   // is its feed.
   NSMutableArray<NSString *> *listed = [NSMutableArray array];
   for (id edge in edges) {
-    id node = [edge isKindOfClass:NSDictionary.class] ? ((NSDictionary *)edge)[@"node"] : nil;
+    id node = ![edge isKindOfClass:NSDictionary.class] ? nil : bare ? edge : ((NSDictionary *)edge)[@"node"];
     if (![node isKindOfClass:NSDictionary.class] || HRIsAlreadyHidden(node)) continue;
     NSString *postID = HRPostIDForNode(node);
     if (postID) [listed addObject:postID];
@@ -643,7 +682,9 @@ static void HRWalk(id object, NSUInteger depth, HideReadFeedStats *stats) {
       if (HRIsSkippedKey(key)) continue;
       id value = dict[key];
       if ([value isKindOfClass:NSArray.class] && HRLooksLikeEdges(value))
-        HRHideReadInEdges(value, dict, stats);  // posts don't nest feeds, so stop here
+        HRHideReadInEdges(value, dict, NO, stats);  // posts don't nest feeds, so stop here
+      else if ([value isKindOfClass:NSArray.class] && HRLooksLikeUnits(value))
+        HRHideReadInEdges(value, dict, YES, stats);
       else if ([value isKindOfClass:NSDictionary.class] || [value isKindOfClass:NSArray.class])
         HRWalk(value, depth + 1, stats);
     }
@@ -661,7 +702,11 @@ static void HRHideReadPosts(NSDictionary *payload, HideReadFeedStats *stats) {
     // A post page (the post plus its comments) is never touched.
     if ([root isKindOfClass:NSDictionary.class] && ((NSDictionary *)root)[@"commentForest"] != nil)
       continue;
-    if ([root isKindOfClass:NSDictionary.class] || [root isKindOfClass:NSArray.class])
+    if ([root isKindOfClass:NSArray.class] && HRLooksLikeEdges(root))
+      HRHideReadInEdges(root, payload, NO, stats);
+    else if ([root isKindOfClass:NSArray.class] && HRLooksLikeUnits(root))
+      HRHideReadInEdges(root, payload, YES, stats);
+    else if ([root isKindOfClass:NSDictionary.class] || [root isKindOfClass:NSArray.class])
       HRWalk(root, 1, stats);
   }
 }
@@ -1130,6 +1175,10 @@ NSString *HROperationName(NSURLRequest *request, NSData *body) {
   return operation;
 }
 
+void HRParseGraphQLRequest(NSURLRequest *request, NSData *body, NSString **operation, NSDictionary **variables) {
+  HRParseRequest(request, body, operation, variables);
+}
+
 // Lookups of posts by id: the details the app refreshes for posts on screen
 // ("FeedPostDetailsByIds"), a post's page ("PostInfoById", "Pdp..."). Never
 // feeds, but they say whether each post is hidden on your account: posts Jax
@@ -1160,7 +1209,7 @@ static BOOL HRIsIgnoredOperation(NSString *operation) {
       @"CookiePreferences", @"DynamicConfigsByNames", @"EnrollInGamification",
       @"ExposeExperimentBatch", @"FeaturedDevvitGame", @"FeedPostDetailsByIds",
       @"FetchIdentityPreferences", @"FetchSubscribedSubreddits", @"GamesPreferences",
-      @"GetAccount", @"GetActiveSubreddits", @"GetAllExperimentVariants",
+      @"GetActiveSubreddits", @"GetAllExperimentVariants",
       @"GetEligibleUXExperiences", @"GetMyShowcaseCarousel", @"GetProfilePostFlairTemplates",
       @"GetRedditUsersByIds", @"GetRedditorByNameApollo", @"GetUserAdEligibility",
       @"GoldBalances", @"LastModeratedSubredditName", @"ModQueueNewItemCount",
@@ -1198,6 +1247,90 @@ BOOL HRShouldProcessRequest(NSURLRequest *request) {
   return NO;
 }
 
+// The account signed in, when an answer names it (data.identity is where
+// Reddit's GraphQL puts the signed-in account), so your posts are told apart
+// even when Reddit's API won't say who you are (HROwnPosts.h).
+static void HRNoteIdentity(NSDictionary *payload, NSString *operation) {
+  id identity = payload[@"identity"];
+  if (![identity isKindOfClass:NSDictionary.class]) return;
+  NSDictionary *fields = identity;
+  for (id candidate in @[ fields[@"redditor"] ?: NSNull.null, fields[@"account"] ?: NSNull.null, fields ]) {
+    if (![candidate isKindOfClass:NSDictionary.class]) continue;
+    id name = ((NSDictionary *)candidate)[@"name"];
+    id accountID = ((NSDictionary *)candidate)[@"id"];
+    if (![name isKindOfClass:NSString.class] || ![accountID isKindOfClass:NSString.class] ||
+        ![(NSString *)accountID hasPrefix:@"t2_"] ||
+        [(NSString *)name rangeOfString:@"^[A-Za-z0-9_-]{3,20}$" options:NSRegularExpressionSearch].location ==
+            NSNotFound)
+      continue;
+    HRLogOnce([@"identity:" stringByAppendingString:operation ?: @"?"], @"[own] %@ says you're signed in as u/%@",
+              operation ?: @"an answer", name);
+    HRAddOwnAccount(name, accountID);
+    return;
+  }
+}
+
+// The titles of the posts in an answer, wherever they are, so their cards on
+// screen can be matched to them (see HRPostIDForText).
+static void HRRememberTitlesIn(id object, NSUInteger depth, NSUInteger *budget) {
+  if (depth > 8 || *budget == 0) return;
+  (*budget)--;
+  if ([object isKindOfClass:NSDictionary.class]) {
+    NSDictionary *dict = object;
+    NSString *postID = HRPostIDFromValue(dict[@"id"]);
+    if (postID && [dict[@"title"] isKindOfClass:NSString.class] && [HRTypename(dict) containsString:@"Post"])
+      HRRememberTitle(postID, dict);
+    for (id value in dict.allValues)
+      if ([value isKindOfClass:NSDictionary.class] || [value isKindOfClass:NSArray.class])
+        HRRememberTitlesIn(value, depth + 1, budget);
+  } else if ([object isKindOfClass:NSArray.class]) {
+    for (id value in (NSArray *)object)
+      if ([value isKindOfClass:NSDictionary.class] || [value isKindOfClass:NSArray.class])
+        HRRememberTitlesIn(value, depth + 1, budget);
+  }
+}
+
+#pragma mark - Recent requests (diagnostics)
+
+// The app's last 80 requests to Reddit's API (operation, and how Jax Reddit
+// Eclipse handled it), so the log can say which came just before a post card it
+// never saw.
+static os_unfair_lock gRecentLock = OS_UNFAIR_LOCK_INIT;
+static NSMutableArray<NSArray *> *gRecent;  // @[when, text], oldest first
+
+void HRNoteAPIRequest(NSString *operation, NSString *how) {
+  if (!HRPref(HRPrefDiagnostics)) return;
+  NSString *text = how.length ? [NSString stringWithFormat:@"%@ (%@)", operation ?: @"unnamed", how]
+                              : (operation ?: @"unnamed");
+  os_unfair_lock_lock(&gRecentLock);
+  if (!gRecent) gRecent = [NSMutableArray array];
+  [gRecent addObject:@[ @(CFAbsoluteTimeGetCurrent()), text ]];
+  if (gRecent.count > 80) [gRecent removeObjectsInRange:NSMakeRange(0, gRecent.count - 80)];
+  os_unfair_lock_unlock(&gRecentLock);
+}
+
+NSString *HRRecentAPIRequests(CFAbsoluteTime since) {
+  NSMutableArray<NSString *> *texts = [NSMutableArray array];
+  NSMutableArray<NSNumber *> *counts = [NSMutableArray array];
+  os_unfair_lock_lock(&gRecentLock);
+  for (NSArray *entry in gRecent) {
+    if ([entry[0] doubleValue] < since) continue;
+    if ([texts.lastObject isEqualToString:entry[1]]) {
+      counts[counts.count - 1] = @(counts.lastObject.unsignedIntegerValue + 1);
+    } else {
+      [texts addObject:entry[1]];
+      [counts addObject:@1];
+    }
+  }
+  os_unfair_lock_unlock(&gRecentLock);
+  NSMutableArray<NSString *> *parts = [NSMutableArray array];
+  for (NSUInteger i = 0; i < texts.count; i++)
+    [parts addObject:counts[i].unsignedIntegerValue > 1
+                         ? [NSString stringWithFormat:@"%@ ×%@", texts[i], counts[i]]
+                         : texts[i]];
+  return parts.count ? [parts componentsJoinedByString:@", "] : @"none";
+}
+
 static _Atomic(NSUInteger) gFeedPostsSeen;
 
 NSUInteger HRFeedPostsSeenCount(void) {
@@ -1224,6 +1357,9 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
     NSString *name = operation ?: @"unnamed operation";
     HRLogOnce([@"api:" stringByAppendingString:name], @"[api] %@ (%@)", name, request.URL.host);
 
+    HRNoteIdentity(payload, name);
+    if ([operation isEqualToString:@"GetAccount"]) return data;  // read for your account's name only
+    BOOL rememberTitles = HRPref(HRPrefDiagnostics) || HRPref(HRPrefMarkOpened) || HRPref(HRPrefMarkScrolledPast);
     if (track) HRRecordReadSignals(operation, variables, payload, requestTime);
     if (!hide) return data;
     BOOL changed = NO;
@@ -1233,6 +1369,12 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
         HRLog(@"[feed] %@: %lu posts hidden on your account left as posts (no \"Post hidden\" rows)", name,
               (unsigned long)shown);
         changed = YES;
+      }
+      // The posts in it (details the app fetches for posts it shows): their
+      // titles, so their cards on screen can be told apart too.
+      if (rememberTitles) {
+        NSUInteger budget = 3000;
+        HRRememberTitlesIn(payload, 0, &budget);
       }
     }
     if (!HRShouldHideInOperation(operation)) {
@@ -1245,8 +1387,9 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
 
     HideReadFeedStats *stats = [HideReadFeedStats new];
     stats.diagnostics = HRPref(HRPrefDiagnostics);
-    stats.rememberTitles = stats.diagnostics || HRPref(HRPrefMarkOpened) || HRPref(HRPrefMarkScrolledPast);
+    stats.rememberTitles = rememberTitles;
     stats.postedBefore = HRPostedCutoff(variables);
+    stats.requested = variables ? HRPostIDsInside(variables, 6, YES, 50).set : nil;
     HRHideReadPosts(payload, stats);
     atomic_fetch_add(&gFeedPostsSeen, stats.posts);
     if (stats.listedPosts.count) {
@@ -1267,8 +1410,11 @@ NSData *HRProcessResponse(NSURLRequest *request, NSData *body, NSData *data,
                   @"[feed] %@ still marks %lu posts hidden by Jax Reddit Eclipse as hidden", name, (unsigned long)left);
     }
     if (stats.posts > 0 || stats.alreadyHidden > 0)
-      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@%@%@", name, (unsigned long)stats.hidden,
+      HRLog(@"[feed] %@: hid %lu of %lu posts%@%@%@%@%@%@", name, (unsigned long)stats.hidden,
             (unsigned long)stats.posts,
+            stats.added ? [NSString stringWithFormat:@" (%lu in a list of posts Reddit adds to a feed)",
+                                                     (unsigned long)stats.added]
+                        : @"",
             stats.crossposts ? [NSString stringWithFormat:@" (%lu crossposts of posts you've read)",
                                                           (unsigned long)stats.crossposts]
                              : @"",
@@ -1374,6 +1520,25 @@ NSArray<NSString *> *HRTakePostsListedBefore(NSString *postID, NSArray<NSString 
   }
   os_unfair_lock_unlock(&gOrderLock);
   return taken;
+}
+
+BOOL HRIsListedWith(NSString *postID, NSArray<NSString *> *neighbors) {
+  if (!postID) return NO;
+  BOOL found = NO;
+  os_unfair_lock_lock(&gOrderLock);
+  for (NSMutableDictionary *order in gOrders) {
+    NSDictionary *index = order[@"index"];
+    if (!index[postID]) continue;
+    if (!neighbors.count) found = YES;
+    for (NSString *other in neighbors)
+      if (![other isEqualToString:postID] && index[other]) {
+        found = YES;
+        break;
+      }
+    if (found) break;
+  }
+  os_unfair_lock_unlock(&gOrderLock);
+  return found;
 }
 
 #pragma mark - Topping up thin pages
